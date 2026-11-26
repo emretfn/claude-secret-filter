@@ -14,31 +14,82 @@ import { GITLEAKS_GLOBAL_ALLOW, GITLEAKS_RULES, type Src } from './gitleaks-rule
 // Placeholders: each masked value gets its own id, `[REDACTED:<id>]` with an
 // 8-hex-digit id. The real value is kept only in this module's memory (never
 // written to disk, never sent to the model); Edit/Write turn placeholders back
-// into real values.
+// into real values, but only in a file the value was read from.
 export const MASK = '[REDACTED'
 const PLACEHOLDER = /\[REDACTED:[0-9a-f]{8}\]/
-const vault = new Map<string, string>()
 
-function fnv(s: string): string {
-  let h = 0x811c9dc5
-  for (let i = 0; i < s.length; i++) {
-    h ^= s.charCodeAt(i)
-    h = Math.imul(h, 0x01000193) >>> 0
+// id -> the real value, and the files it was seen in (the only files it is restored into)
+type Entry = { value: string; sources: Set<string> }
+const vault = new Map<string, Entry>()
+const idOf = new Map<string, string>()
+
+// SHA-256, synchronous (crypto.subtle is async): ids are a keyed hash, so a placeholder
+// seen outside (a URL, a commit message) cannot be checked against guessed values.
+const K256 = Uint32Array.from([
+  0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5, 0xd807aa98, 0x12835b01,
+  0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc,
+  0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da, 0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147,
+  0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+  0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070, 0x19a4c116, 0x1e376c08,
+  0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3, 0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208,
+  0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
+])
+export function sha256hex(text: string): string {
+  const msg = new TextEncoder().encode(text)
+  const len = Math.ceil((msg.length + 9) / 64) * 64
+  const buf = new Uint8Array(len)
+  buf.set(msg)
+  buf[msg.length] = 0x80
+  const bits = msg.length * 8
+  const dv = new DataView(buf.buffer)
+  dv.setUint32(len - 8, Math.floor(bits / 2 ** 32))
+  dv.setUint32(len - 4, bits >>> 0)
+  const h = Uint32Array.from([0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19])
+  const w = new Uint32Array(64)
+  const rotr = (x: number, n: number) => (x >>> n) | (x << (32 - n))
+  for (let off = 0; off < len; off += 64) {
+    for (let i = 0; i < 16; i++) w[i] = dv.getUint32(off + i * 4)
+    for (let i = 16; i < 64; i++) {
+      const a = w[i - 15]!, b = w[i - 2]!
+      w[i] = (w[i - 16]! + (rotr(a, 7) ^ rotr(a, 18) ^ (a >>> 3)) + w[i - 7]! + (rotr(b, 17) ^ rotr(b, 19) ^ (b >>> 10))) >>> 0
+    }
+    let [a, b, c, d, e, f, g, hh] = h as unknown as number[] as [number, number, number, number, number, number, number, number]
+    for (let i = 0; i < 64; i++) {
+      const t1 = (hh + (rotr(e, 6) ^ rotr(e, 11) ^ rotr(e, 25)) + ((e & f) ^ (~e & g)) + K256[i]! + w[i]!) >>> 0
+      const t2 = ((rotr(a, 2) ^ rotr(a, 13) ^ rotr(a, 22)) + ((a & b) ^ (a & c) ^ (b & c))) >>> 0
+      hh = g; g = f; f = e; e = (d + t1) >>> 0; d = c; c = b; b = a; a = (t1 + t2) >>> 0
+    }
+    const v = [a, b, c, d, e, f, g, hh]
+    for (let i = 0; i < 8; i++) h[i] = (h[i]! + v[i]!) >>> 0
   }
-  return h.toString(16).padStart(8, '0')
+  return [...h].map(x => x.toString(16).padStart(8, '0')).join('')
 }
+
+const KEY = [...crypto.getRandomValues(new Uint8Array(16))].map(x => x.toString(16).padStart(2, '0')).join('')
+const keyedId = (s: string) => sha256hex(KEY + s).slice(0, 8)
+
+// The files the output being redacted came from (set by `redact`): every value masked in
+// it may be restored into them.
+let currentSources: readonly string[] = []
 
 /**
  * Masks a value. `learn`: also mask it wherever it shows up later. Off for the
  * entropy layer, a guess: one false positive there must not spread.
  */
 export function mask(value: string, learn = true): string {
-  let id = fnv(value)
-  while (vault.has(id) && vault.get(id) !== value) id = fnv(id + value)
-  vault.set(id, value)
+  let id = idOf.get(value)
+  if (id === undefined) {
+    id = keyedId(value)
+    while (vault.has(id)) id = keyedId(id + value)
+    vault.set(id, { value, sources: new Set() })
+    idOf.set(value, id)
+  }
+  for (const s of currentSources) vault.get(id)!.sources.add(normPath(s))
   if (learn) remember(value)
   return `${MASK}:${id}]`
 }
+
+const normPath = (p: string) => p.trim().replace(/\/+/g, '/').replace(/\/(?:\.\/)+/g, '/')
 
 export const hasPlaceholder = (text: string) => PLACEHOLDER.test(text)
 
@@ -46,18 +97,40 @@ export const hasPlaceholder = (text: string) => PLACEHOLDER.test(text)
 export const hits = new Map<string, number>()
 const hit = (k: string) => hits.set(k, (hits.get(k) ?? 0) + 1)
 
-/** Turns placeholders back into real values; lists the ones it does not know. */
-export function restore(text: string): { text: string; missing: string[] } {
+/**
+ * Turns placeholders back into real values, for a write to `target`. A value is restored
+ * only into a file it was read from (`foreign` lists the others), never under `.git/`:
+ * a placeholder copied into a new script, a URL or another file would otherwise carry
+ * the real value out. `missing`: placeholders this module does not know.
+ */
+export function restore(text: string, target: string): { text: string; missing: string[]; foreign: string[] } {
   const missing: string[] = []
+  const foreign: string[] = []
+  const t = normPath(target)
+  const blocked = t === '' || /(?:^|\/)\.git(?:\/|$)/.test(t)
   const out = text.replace(/\[REDACTED:([0-9a-f]{8})\]/g, (m, id: string) => {
-    const v = vault.get(id)
-    if (v === undefined) {
+    const en = vault.get(id)
+    if (en === undefined) {
       missing.push(m)
       return m
     }
-    return v
+    if (blocked || !en.sources.has(t)) {
+      foreign.push(m)
+      return m
+    }
+    return en.value
   })
-  return { text: out, missing }
+  return { text: out, missing, foreign }
+}
+
+/** A value that was restored into a file is masked in every later output, whatever it looks like. */
+export function pinRestored(text: string): void {
+  for (const m of text.matchAll(/\[REDACTED:([0-9a-f]{8})\]/g)) {
+    const v = vault.get(m[1]!)?.value
+    if (v === undefined || v.length < 4 || pinned.has(v)) continue
+    for (const x of [v, b64(v), b64(v, true).replace(/=+$/, ''), encodeURIComponent(v)]) if (x.length >= 4) pinned.add(x)
+    knownSorted = undefined
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -76,8 +149,13 @@ export function isPlaceholderValue(v: string): boolean {
 // ---------------------------------------------------------------------------
 // Layer 0: known values, with encoded variants.
 const known = new Set<string>()
+const pinned = new Set<string>() // restored into a file: masked always (pinRestored)
 let knownSorted: string[] | undefined
+// Seeds and values learned while working have budgets of their own, so a repository
+// full of planted values cannot crowd out what is learned later.
 const MAX_KNOWN = 2000
+const MAX_SEEDED = 500
+let seeded = 0
 
 function b64(s: string, url = false): string {
   const bytes = new TextEncoder().encode(s)
@@ -110,15 +188,15 @@ function isDistinctive(v: string): boolean {
 /** Remembers a secret value (and its base64 / URL-encoded forms) to mask everywhere. */
 export function remember(value: string): void {
   const v = value.trim()
-  if (known.size >= MAX_KNOWN || !isDistinctive(v)) return
+  if (known.size >= MAX_KNOWN + MAX_SEEDED * 4 || !isDistinctive(v)) return
   const variants = [v, b64(v), b64(v, true).replace(/=+$/, ''), encodeURIComponent(v)]
   for (const x of variants) if (x.length >= 8 && !known.has(x)) known.add(x)
   knownSorted = undefined
 }
 
 function maskKnown(text: string): { text: string; count: number } {
-  if (known.size === 0) return { text, count: 0 }
-  knownSorted ??= [...known].sort((a, b) => b.length - a.length)
+  if (known.size === 0 && pinned.size === 0) return { text, count: 0 }
+  knownSorted ??= [...new Set([...known, ...pinned])].sort((a, b) => b.length - a.length)
   let count = 0
   let out = text
   for (const v of knownSorted) {
@@ -296,7 +374,7 @@ const QUOTED_NOT_SECRET = /^(?:\/[\w\-\/{}:.]*|[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+)$/
 const spellsName = (name: string, v: string) => words(name).join('') === words(v).join('')
 
 // name, separator, value: quoted or not
-const ASSIGN = /(["']?)\b([A-Za-z_][A-Za-z0-9_.-]*)\1(\s*)(:|=)(?!=)(\s*)(?:(["'`])([^"'`\n]*)\6|([^\s"'`,;<>)]+))/g
+const ASSIGN = /(["']?)\b([A-Za-z_][A-Za-z0-9_.-]{0,63})\1(\s*)(:|=)(?!=)(\s*)(?:(["'`])([^"'`\n]*)\6|([^\s"'`,;<>)]+))/g
 
 function assignments(text: string, depth = 0): { text: string; count: number } {
   let count = 0
@@ -334,7 +412,7 @@ function assignments(text: string, depth = 0): { text: string; count: number } {
 
 const KEEP_NAME: RegExp[] = [
   /((?:\b[Bb]earer|\bBasic|Authorization:\s*Token)\s+)(?=\S*\d)([A-Za-z0-9._~+\/=-]{16,})/g, // Authorization header
-  /([a-z][a-z0-9+.-]*:\/\/[^\s:\/@]*:)([^\s@\/]+)(?=@)/gi, // scheme://user:pass@host
+  /((?<![a-z0-9+.-])[a-z][a-z0-9+.-]{0,31}:\/\/[^\s:\/@]{0,256}:)([^\s@\/]+)(?=@)/gi, // scheme://user:pass@host
   /(\/\/[^\s\/]+\/:_authToken=)(\S+)/g, // .npmrc
   /([?&](?:token|access_token|api[_-]?key|key|sig|signature|code|password|secret)=)([^&\s"'#]{8,})/gi, // URL query
   /(\bdiscord(?:app)?\.com\/api\/webhooks\/\d+\/)([\w-]{20,})/g, // Discord webhook
@@ -396,7 +474,24 @@ const ENV_SAFE_NAME =
   /^(?:PATH|HOME|SHELL|USER|LOGNAME|PWD|OLDPWD|LANG|LC_\w+|TERM|TERM_\w+|TMPDIR|SHLVL|EDITOR|COLORTERM|_|NODE_ENV|ASPNETCORE_ENVIRONMENT|PORT)$/
 const ENV_SAFE_VALUE = /^["']?(?:true|false|null|yes|no|on|off|\d+(?:\.\d+)?)?["']?$/i
 
+// Secret files that are not KEY=value: .pgpass (host:port:db:user:password), .netrc
+const PGPASS_LINE = /^(?![^:]*=)((?:[^:\s#]|\\:)+:(?:[^:\s]|\\:)+:(?:[^:\s]|\\:)+:(?:[^:\s]|\\:)+:)(\S.*)$/
+const NETRC_PASSWORD = /(\b(?:password|passwd|account)\s+)(\S+)/g
+
 function envLine(line: string): { line: string; hit: boolean } {
+  const pg = PGPASS_LINE.exec(line)
+  if (pg && !isPlaceholderValue(pg[2]!) && !pg[2]!.includes(MASK)) {
+    hit('env')
+    return { line: pg[1] + mask(pg[2]!), hit: true }
+  }
+  if (/^\s*(?:machine|default)\b/.test(line) || /^\s*(?:login|password)\s/.test(line)) {
+    let n = 0
+    const out = line.replace(NETRC_PASSWORD, (m, head: string, v: string) => (v.includes(MASK) || isPlaceholderValue(v) ? m : (n++, head + mask(v))))
+    if (n > 0) {
+      hit('env')
+      return { line: out, hit: true }
+    }
+  }
   const m = ENV_LINE.exec(line)
   if (!m) return { line, hit: false }
   const name = m[1]!.replace(/^\s*(?:export\s+)?["']?|["']?\s*(?:=|:\s)$/g, '')
@@ -413,9 +508,16 @@ function envLine(line: string): { line: string; hit: boolean } {
  * masked wherever it shows up later (logs, stack traces, base64 in a config dump).
  * What is taken follows `remember`'s rules (no identifiers, no plain URLs).
  */
+// A seeded value that reads like code is a decoy a cloned repository could plant to hide
+// that code (`exec(req.query.cmd)`, `isAdmin || true`): real values do not look like this.
+const CODE_LIKE = /\s|[A-Za-z_$][\w$.]*\(|\|\||&&|=>|\bthis\.|\breturn\b|[{}]/
+const MAX_SEED_PER_FILE = 100
+
 export function seedEnvText(text: string): number {
   let n = 0
+  let tried = 0
   for (const line of text.split('\n')) {
+    if (seeded >= MAX_SEEDED || tried >= MAX_SEED_PER_FILE) break
     if (/^\s*#/.test(line)) continue
     const m = ENV_LINE.exec(line)
     if (!m) continue
@@ -423,10 +525,14 @@ export function seedEnvText(text: string): number {
     let v = m[2]!.trim()
     const q = /^(["'])(.*)\1$/.exec(v)
     v = q ? q[2]! : v.replace(/\s+#.*$/, '')
-    if (ENV_SAFE_NAME.test(name) || ENV_SAFE_VALUE.test(v) || isPlaceholderValue(v)) continue
+    if (ENV_SAFE_NAME.test(name) || ENV_SAFE_VALUE.test(v) || isPlaceholderValue(v) || CODE_LIKE.test(v)) continue
+    tried++
     const before = known.size
     remember(v)
-    if (known.size > before) n++
+    if (known.size > before) {
+      n++
+      seeded++
+    }
   }
   return n
 }
@@ -441,7 +547,7 @@ export const isEnvFile = (path: string) => ENV_FILE.test(path) && !isTemplateEnv
 // grep output "path:line:text" / "path:text": split at the first ':' or '-' where
 // the path so far is an env file (the path itself may contain '-').
 function grepSplit(line: string): { head: string; rest: string } | undefined {
-  for (let i = 0; i < line.length; i++) {
+  for (let i = 0; i < Math.min(line.length, 512); i++) {
     const c = line[i]
     if (c !== ':' && c !== '-') continue
     const path = line.slice(0, i)
@@ -457,8 +563,12 @@ function grepSplit(line: string): { head: string; rest: string } | undefined {
 const ANSI = /\x1b\[[0-9;?]*[A-Za-z]|\x1b\][^\x07]*\x07/g
 const MAX_LINE = 20000
 
-/** `paths`: the files the output came from, when known (path-scoped gitleaks rules need them). */
-export type Options = { envMode?: boolean; paths?: readonly string[] }
+/**
+ * `paths`: the files the output may have come from (path-scoped gitleaks rules need them).
+ * `sources`: the files the output certainly is the content of (a Read's file): values masked
+ * in it may be restored into these files, and only these.
+ */
+export type Options = { envMode?: boolean; paths?: readonly string[]; sources?: readonly string[] }
 
 function redactLine(line: string, opts: Options): { line: string; count: number } {
   let count = 0
@@ -479,6 +589,15 @@ function redactLine(line: string, opts: Options): { line: string; count: number 
 }
 
 export function redact(text: string, opts: Options = {}): { text: string; count: number } {
+  currentSources = opts.sources ?? []
+  try {
+    return redactAll(text, opts)
+  } finally {
+    currentSources = []
+  }
+}
+
+function redactAll(text: string, opts: Options): { text: string; count: number } {
   let count = 0
   let out = text.includes('\x1b') ? text.replace(ANSI, '') : text
 

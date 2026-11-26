@@ -2,9 +2,9 @@
 """Fails a pull request that changes what the plugin ships without raising its version.
 
 Installed copies update by version: a change to shipped files with the same version
-may never reach anyone. Shipped files are everything under hooks/ and the manifests
-in .claude-plugin/. Docs, tests, scripts and CI change nothing installed, so they
-need no bump.
+may never reach anyone. The marketplace installs the whole repository, so every file
+is shipped except docs, tests, scripts, CI and the repository's own notes, which
+change nothing an installed copy runs.
 
   python3 scripts/check-version-bump.py origin/main   # compare HEAD with the PR's base
 """
@@ -13,7 +13,8 @@ import re
 import subprocess
 import sys
 
-SHIPPED = ("hooks/", ".claude-plugin/")
+NOT_SHIPPED = ("docs/", "tests/", "scripts/", ".github/", ".claude/", ".gitignore", "AGENTS.md", "README.md",
+               "SECURITY.md", "LICENSE", "THIRD_PARTY_NOTICES.md", "tsconfig.json")
 MANIFEST = ".claude-plugin/plugin.json"
 
 
@@ -33,7 +34,7 @@ def main() -> None:
     base = sys.argv[1] if len(sys.argv) > 1 else "origin/main"
     merge_base = git("merge-base", base, "HEAD").strip()
     changed = [p for p in git("diff", "--name-only", merge_base, "HEAD").splitlines() if p]
-    shipped = [p for p in changed if p.startswith(SHIPPED)]
+    shipped = [p for p in changed if not p.startswith(NOT_SHIPPED)]
     before, after = version_at(merge_base), version_at("HEAD")
     fmt = lambda v: ".".join(map(str, v))
 

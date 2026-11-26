@@ -4,7 +4,7 @@
 // A placeholder literal is built at run time too: the mod refuses to write one it does not know.
 import { expect, test } from 'claude-code/testing'
 import { GITLEAKS_RULES } from '../hooks/gitleaks-rules'
-import { gitleaksSkipped, hasPlaceholder, isSecretName, looksRandom, redact, remember, restore, seedEnvText } from '../hooks/redact'
+import { gitleaksSkipped, hasPlaceholder, isSecretName, looksRandom, redact, remember, restore, seedEnvText, sha256hex } from '../hooks/redact'
 
 const ALNUM = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789'
 const B32 = 'abcdefghijklmnopqrstuvwxyz234567'
@@ -195,13 +195,16 @@ test('placeholders round-trip: masked for the model, restored for the write', ()
   const pw = rnd(16) + '9'
   const pat = rnd(52, B32).replace(/^./, 'a').replace(/.$/, '7')
   const file = `{\n  "Db": "Server=db;Password=${pw};",\n  "Pat": "${pat}",\n  "LogLevel": "Information"\n}`
-  const seen = redact(file).text
+  const seen = redact(file, { sources: ['/app/appsettings.json'] }).text
   expect(seen.includes(pw) || seen.includes(pat)).toBe(false)
   const oldS = seen.split('\n').slice(1, 4).join('\n')
-  const back = restore(oldS)
+  const back = restore(oldS, '/app/appsettings.json')
   expect(back.missing).toEqual([])
+  expect(back.foreign).toEqual([])
   expect(file.includes(back.text)).toBe(true)
-  expect(restore(unknownPlaceholder).missing).toEqual([unknownPlaceholder])
+  // only into the file it was read from
+  expect(restore(oldS, '/app/other.json').foreign.length).toBeGreaterThan(0)
+  expect(restore(unknownPlaceholder, '/app/appsettings.json').missing).toEqual([unknownPlaceholder])
 })
 
 test('the same value always gets the same placeholder', () => {
@@ -221,4 +224,29 @@ test('a large output is redacted quickly', () => {
   const t0 = Date.now()
   redact(big)
   expect(Date.now() - t0).toBeLessThan(5000)
+})
+
+// --- hostile input ------------------------------------------------------------
+test('adversarial long lines are redacted in linear time', () => {
+  const cases = ['a.'.repeat(80000), 'a'.repeat(160000), 'a-'.repeat(80000), '-'.repeat(160000), 'x:'.repeat(80000), 'Bearer 1'.repeat(20000)]
+  for (const c of cases) {
+    const t0 = Date.now()
+    redact(c)
+    expect(Date.now() - t0).toBeLessThan(1500)
+  }
+})
+
+test('seeding skips values that read like code (decoys)', () => {
+  const n = seedEnvText(['CMD=exec(req.query.cmd)', 'CHECK=isAdmin||true', 'FN=x=>x', 'OK=' + 'Zq' + rnd(18) + '4'].join('\n'))
+  expect(n).toBe(1)
+  expect(kept('const out = exec(req.query.cmd)')).toBe(true)
+  expect(kept('if (isAdmin||true) allow()')).toBe(true)
+})
+
+test('placeholder ids do not reveal the value (keyed per session)', () => {
+  // the id of a known value is not its plain hash: offline guessing needs the session key
+  const v = 'Password=' + rnd(12) + '1;'
+  const id = /\[REDACTED:([0-9a-f]{8})\]/.exec(redact(v).text)![1]!
+  expect(id).not.toBe(sha256hex(v.slice(9, -1)).slice(0, 8))
+  expect(sha256hex('abc')).toBe('ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad')
 })
