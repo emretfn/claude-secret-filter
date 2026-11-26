@@ -1,0 +1,138 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>secret-filter · Redaction layers</title>
+  <link href="https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&family=Geist:wght@400;500;600&family=Geist+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    :root {
+      --color-paper:   #f5f5f5;
+      --color-ink:     #2d3142;
+      --color-muted:   #4f5d75;
+      --color-accent:  #bf4520;
+      --font-sans:     'Geist', system-ui, sans-serif;
+      --font-serif:    'Instrument Serif', serif;
+      --font-mono:     'Geist Mono', ui-monospace, monospace;
+    }
+    body {
+      font-family: var(--font-sans);
+      background: var(--color-paper);
+      color: var(--color-ink);
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 3rem 2rem;
+    }
+    .frame { max-width: 1000px; width: 100%; }
+    .diagram-container { width: 100%; overflow-x: auto; }
+    .eyebrow {
+      font-family: var(--font-mono);
+      font-size: 0.66rem;
+      font-weight: 500;
+      letter-spacing: 0.18em;
+      text-transform: uppercase;
+      color: var(--color-muted);
+      margin-bottom: 0.5rem;
+    }
+    h1 {
+      font-family: var(--font-serif);
+      font-size: clamp(1.5rem, 2.4vw + 0.75rem, 2rem);
+      font-weight: 400;
+      letter-spacing: -0.02em;
+      line-height: 1.15;
+      color: var(--color-ink);
+      margin-bottom: 1.5rem;
+    }
+    svg { width: 100%; min-width: 960px; display: block; }
+    @media print {
+      .diagram-container { overflow-x: visible; }
+      svg { min-width: 0; }
+    }
+  </style>
+</head>
+<body>
+  <div class="frame">
+    <p class="eyebrow">Layer stack · secret-filter</p>
+    <h1>The redaction engine, layer by layer</h1>
+
+    <div class="diagram-container">
+      <svg viewBox="0 0 960 540" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="layers-title layers-desc">
+        <title id="layers-title">The redaction engine, layer by layer</title>
+        <desc id="layers-desc">Every string of a tool's output passes five layers in order (known values, known formats, secret-named fields, entropy and env mode) before Claude reads it with placeholders in place of secrets.</desc>
+        <defs>
+          <marker id="arrow" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#4f5d75"/></marker>
+          <marker id="arrow-accent" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#bf4520"/></marker>
+          <marker id="arrow-link" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#2e5aa8"/></marker>
+        </defs>
+
+        <rect width="100%" height="100%" fill="#f5f5f5"/>
+
+        <!-- ============ ARROWS ============ -->
+        <!-- input -> stack -->
+        <line x1="480" y1="80" x2="480" y2="110" stroke="#4f5d75" stroke-width="1.2" marker-end="url(#arrow)"/>
+        <!-- stack -> Claude (headline) -->
+        <line x1="480" y1="432" x2="480" y2="470" stroke="#bf4520" stroke-width="1.4" marker-end="url(#arrow-accent)"/>
+        <!-- direction indicator, left margin -->
+        <line x1="56" y1="128" x2="56" y2="414" stroke="#4f5d75" stroke-width="1" marker-end="url(#arrow)"/>
+        <rect x="28" y="104" width="56" height="12" rx="2" fill="#f5f5f5"/>
+        <text x="56" y="113" fill="#5a6580" font-size="8" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="middle" letter-spacing="0.14em">IN ORDER</text>
+
+        <!-- ============ INPUT ============ -->
+        <rect x="392" y="48" width="176" height="32" rx="6" fill="#f5f5f5"/>
+        <rect x="392" y="48" width="176" height="32" rx="6" fill="rgba(45,49,66,0.03)" stroke="rgba(45,49,66,0.30)" stroke-width="1"/>
+        <text x="480" y="68" fill="#2d3142" font-size="12" font-weight="600" font-family="'Geist', system-ui, sans-serif" text-anchor="middle">Tool output</text>
+
+        <!-- ============ STACK ============ -->
+        <rect x="96" y="112" width="808" height="320" rx="6" fill="#f5f5f5"/>
+        <rect x="96" y="112" width="808" height="320" rx="6" fill="#ffffff" stroke="#4f5d75" stroke-width="1"/>
+
+        <!-- L0: focal -->
+        <path d="M 102,112 H 898 Q 904,112 904,118 V 176 H 96 V 118 Q 96,112 102,112 Z" fill="rgba(191,69,32,0.08)" stroke="#bf4520" stroke-width="1.2"/>
+        <text x="120" y="149" fill="#bf4520" font-size="8" font-family="'Geist Mono', ui-monospace, monospace" letter-spacing="0.14em">L0</text>
+        <text x="160" y="149" fill="#2d3142" font-size="14" font-weight="600" font-family="'Geist', system-ui, sans-serif">Known values</text>
+        <text x="884" y="141" fill="#4f5d75" font-size="9.5" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="end">any value masked once, or seeded from .env files</text>
+        <text x="884" y="156" fill="#4f5d75" font-size="9.5" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="end">masked anywhere, also base64 and URL-encoded</text>
+
+        <!-- dividers -->
+        <line x1="96" y1="240" x2="904" y2="240" stroke="rgba(45,49,66,0.12)" stroke-width="1"/>
+        <line x1="96" y1="304" x2="904" y2="304" stroke="rgba(45,49,66,0.12)" stroke-width="1"/>
+        <line x1="96" y1="368" x2="904" y2="368" stroke="rgba(45,49,66,0.12)" stroke-width="1"/>
+
+        <!-- L1 -->
+        <text x="120" y="213" fill="#5a6580" font-size="8" font-family="'Geist Mono', ui-monospace, monospace" letter-spacing="0.14em">L1</text>
+        <text x="160" y="213" fill="#2d3142" font-size="14" font-weight="600" font-family="'Geist', system-ui, sans-serif">Known formats</text>
+        <text x="884" y="205" fill="#4f5d75" font-size="9.5" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="end">about 30 rules of our own, then 221 gitleaks rules</text>
+        <text x="884" y="220" fill="#4f5d75" font-size="9.5" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="end">ghp_, sk-ant-, Azure DevOps PATs, JWTs, private keys</text>
+
+        <!-- L2 -->
+        <text x="120" y="277" fill="#5a6580" font-size="8" font-family="'Geist Mono', ui-monospace, monospace" letter-spacing="0.14em">L2</text>
+        <text x="160" y="277" fill="#2d3142" font-size="14" font-weight="600" font-family="'Geist', system-ui, sans-serif">Secret-named fields</text>
+        <text x="884" y="269" fill="#4f5d75" font-size="9.5" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="end">password, secret, token, apiKey, Password=…;</text>
+        <text x="884" y="284" fill="#4f5d75" font-size="9.5" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="end">code stays readable: types, calls, assignments</text>
+
+        <!-- L3 -->
+        <text x="120" y="341" fill="#5a6580" font-size="8" font-family="'Geist Mono', ui-monospace, monospace" letter-spacing="0.14em">L3</text>
+        <text x="160" y="341" fill="#2d3142" font-size="14" font-weight="600" font-family="'Geist', system-ui, sans-serif">Entropy</text>
+        <text x="884" y="333" fill="#4f5d75" font-size="9.5" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="end">random-looking tokens of 24+ chars, no label needed</text>
+        <text x="884" y="348" fill="#4f5d75" font-size="9.5" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="end">a guess, so never learned as a known value</text>
+
+        <!-- L4 -->
+        <text x="120" y="405" fill="#5a6580" font-size="8" font-family="'Geist Mono', ui-monospace, monospace" letter-spacing="0.14em">L4</text>
+        <text x="160" y="405" fill="#2d3142" font-size="14" font-weight="600" font-family="'Geist', system-ui, sans-serif">Env mode</text>
+        <text x="884" y="397" fill="#4f5d75" font-size="9.5" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="end">.env*, .npmrc, .netrc, printenv, grep lines from them</text>
+        <text x="884" y="412" fill="#4f5d75" font-size="9.5" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="end">every value, except booleans, numbers, safe names</text>
+
+        <!-- ============ OUTPUT ============ -->
+        <rect x="352" y="472" width="256" height="32" rx="6" fill="#f5f5f5"/>
+        <rect x="352" y="472" width="256" height="32" rx="6" fill="rgba(79,93,117,0.10)" stroke="#5a6580" stroke-width="1"/>
+        <text x="480" y="492" fill="#2d3142" font-size="12" font-weight="600" font-family="'Geist', system-ui, sans-serif" text-anchor="middle">Claude reads placeholders</text>
+
+        <text x="632" y="492" fill="#4f5d75" font-size="14" font-style="italic" font-family="'Instrument Serif', serif">Each layer skips what an earlier one masked.</text>
+      </svg>
+    </div>
+  </div>
+</body>
+</html>
