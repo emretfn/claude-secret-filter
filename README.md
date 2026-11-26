@@ -105,6 +105,8 @@ claude plugin test .       # unit tests (tests/redact.test.ts) and engine integr
 ```
 
 Tests generate their secrets at run time, so no real-looking token is committed.
+Before changing the mod, read [AGENTS.md](AGENTS.md): it covers the no-egress rule,
+version bumps and releases, and how to add detection rules and tests.
 
 To update the gitleaks rules:
 

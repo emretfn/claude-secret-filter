@@ -17,8 +17,14 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+          fetch-depth: 0
       - name: No egress in the mod's code
         run: python3 scripts/check-no-egress.py
+      - name: Version bumped when shipped files change
+        if: github.event_name == 'pull_request'
+        env:
+          BASE: ${{ github.base_ref }}
+        run: python3 scripts/check-version-bump.py "origin/$BASE"
       - name: gitleaks rules are generated, not hand-edited
         run: |
           python3 scripts/gen-gitleaks-rules.py
