@@ -1,6 +1,6 @@
 {
   "name": "secret-filter",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "Masks API keys, tokens, passwords and .env values in tool output before Claude reads it, with reversible placeholders for edits",
   "license": "MIT",
   "keywords": [

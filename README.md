@@ -26,6 +26,13 @@ box, then **Plugins**, **Add marketplace** with `emretfn/claude-secret-filter`, 
 
 Nothing else needs to be installed: gitleaks' rules ship converted, as a file.
 
+> **Disclaimer.** secret-filter is best-effort defense in depth, provided "as is" under
+> the MIT license, without warranty of any kind. It reduces the chance that a secret
+> reaches the model; it does not guarantee that none will, and it is not a substitute
+> for keeping secrets out of reach (a secrets manager, least-privilege credentials,
+> rotating anything that may have been exposed). You are responsible for how you use
+> it and for the secrets in your environment. See [Disclaimer](#disclaimer) below.
+
 > **Requirements.** The mod uses Claude Code's *function hooks* API, which is in
 > early access and may change between releases. It was built and tested on Claude
 > Code 2.1.332. Classic `PostToolUse` hooks cannot do some of what it does (see below).
@@ -37,7 +44,7 @@ Nothing else needs to be installed: gitleaks' rules ship converted, as a file.
 - **Reading.** Every call to `Bash`, `Read`, `WebFetch`, `WebSearch` or an MCP tool runs as usual. Its output goes through the redaction engine before Claude sees it, failed calls included. Claude reads placeholders where the secrets were.
 - **Everything else.** Every other row the conversation keeps (other tools such as `Monitor`, background task and subagent results, notifications, attachments) goes through the same engine before the model or the transcript file reads it. Only your own prompt and Claude's own reply are left as written.
 - **The vault.** Each masked value is kept in the mod's memory under its placeholder id, with the files it was read from. Values from the project's git-ignored `.env`-style files are learned at session start.
-- **Writing.** When Claude edits a file and copies a placeholder into `Edit`, `Write` or `NotebookEdit`, the write hook swaps the real value back in before the write, **only in a file the value was read from**. What the tool returns is masked again.
+- **Writing.** When Claude edits a file and copies a placeholder into `Edit`, `Write` or `NotebookEdit`, the write hook swaps the real value back in before the write, **only in the file the value was read from, and only where it already was** (its own line). What the tool returns is masked again.
 
 The diagram sources are in [`docs/`](docs/) (HTML with inline SVG).
 
@@ -69,11 +76,14 @@ from env files.
 - For `Edit`, `Write` and `NotebookEdit`, placeholders in the input are turned back
   into the real values just before the write. The tool's result is masked again,
   and a restored value stays masked in every later output, whatever it looks like.
-- **A value is only restored into a file it was read with `Read` from**, and never
-  under `.git/`. A placeholder copied into another file, a new script or a URL is
-  refused, so a prompt injection cannot make the mod write a secret somewhere it
-  can be run or sent. Command output (`cat a b`) names no file for sure, so its
-  placeholders are restored nowhere. To move a secret to a new place, add it yourself.
+- **A value is only restored into the file it was read from with `Read`, and only
+  where it already was**: each place it lands, the text around it on its line must
+  be part of a line it had in that file (or in the `old_string` an `Edit` replaces).
+  It can be kept, or its line trimmed, never moved into a new line, another file,
+  a new script, a notebook cell or a URL; nothing is restored under `.git/`. So a
+  prompt injection cannot make the mod write a secret somewhere it can be run or
+  sent. Command output (`cat a b`) names no file for sure, so its placeholders are
+  restored nowhere. To move a secret to a new place, add it yourself.
 - In auto mode, a write that restores real values is put to you instead of to the
   classifier, which would read its input.
 - A placeholder the mod does not know (after a reload) makes the write refuse
@@ -100,7 +110,11 @@ This is defense in depth, not a guarantee. It does not:
 - stop a command from **sending** a secret somewhere (`curl -d "$TOKEN" …`): it only
   filters what Claude reads.
 - mask what you type or paste into the prompt yourself, or the output of a `!`
-  command you run: those are yours, kept as written.
+  command you run: those are yours, kept as written. An `@`-mention of a secret
+  file is refused (Claude can `Read` it, masked); other mentions are masked.
+- keep a determined or hostile model from a secret: `curl -d @.env …`, `base64 .env`
+  or `rev` in a command get around any output filter. It guards against accidental
+  exposure.
 - hide a restored value from what runs beneath the write: the permission dialog
   shows it to you, and your own classic `PreToolUse` hooks receive it.
 - catch every short random token: the entropy layer misses about 20% of 24-char
@@ -113,6 +127,26 @@ secret file committed to a cloned repository is not yours, and could plant "deco
 that hide ordinary code. Plain words, code identifiers, plain URLs and values that
 read like code are not learned, and seeds have a budget of their own (500 values, 100
 per file), so they cannot crowd out what is learned while working.
+
+## Disclaimer
+
+This software is provided "as is", without warranty of any kind, express or implied,
+as the [MIT license](LICENSE) states in full. In particular:
+
+- It is a best-effort filter. Detection is heuristic: secrets in unknown formats,
+  short values, split or encoded secrets, or output shapes the mod does not see may
+  pass through unmasked. Do not rely on it as your only safeguard.
+- It runs on an early-access Claude Code API that may change and break it without
+  notice.
+- If a secret may have reached the model, a transcript, a log or a third party,
+  treat it as exposed and rotate it.
+- The authors and contributors are not liable for any claim, damages, data loss,
+  credential exposure or other liability arising from its use or inability to use it.
+- It is an independent project, not made, endorsed or supported by Anthropic.
+  "Claude" and "Claude Code" are names of Anthropic's products, used here only to say
+  what the plugin works with.
+
+By installing or using it you accept these terms and the license.
 
 ## Development
 

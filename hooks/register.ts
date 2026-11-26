@@ -1,5 +1,11 @@
 import type { Register } from 'claude-code'
-import { MASK, hasPlaceholder, isEnvFile, pinRestored, redact, restore, seedEnvText, type Options } from './redact'
+import {
+  MASK, hasPlaceholder, isEnvFile, maskKnownOnly, movedValues, pinRestored, redact, restore, seedEnvText, withBudget,
+  type Options,
+} from './redact'
+
+// Redaction of one result may take this long; past it the output is withheld.
+const BUDGET_MS = 6000
 
 // Tools whose output is filtered here, with what is known of the call (its files, env
 // mode): those that read files, commands or the web, and every MCP tool. Every other row
@@ -27,6 +33,7 @@ function paths(e: Loose): string[] {
   if (e.tool === 'Bash') {
     return str(e, 'command')
       .split(/[\s"'`|;&<>()=]+/)
+      .map(t => t.replace(/[*?[\]{}]+$/, '').replace(/\*/g, 'x')) // `.env*`, `*.env`: a glob may name an env file
       .filter(t => /[\w-]\.[\w]+$|\/[\w.-]+$/.test(t) || isEnvFile(t))
   }
   const p = target(e)
@@ -56,22 +63,28 @@ function envMode(e: Loose): boolean {
 
 const options = (e: Loose): Options => ({ envMode: envMode(e), paths: paths(e), sources: sources(e) })
 
-// Binary content (an image or PDF the Read tool returns, an MCP image block) is left
-// alone: masking its base64 would corrupt it, and text rules cannot hide a secret in it.
-// Anything else that only claims to be binary (a `.env` served as octet-stream, a
-// base64 blob of text) is decoded and filtered as text.
-const MEDIA_TYPE = /^(?:image|audio|video|pdf|document)$/
-const MEDIA_MIME = /^(?:image|audio|video|font)\/|^application\/(?:pdf|zip|gzip|x-tar|x-7z-compressed)$/i
+// The source of the cell a NotebookEdit replaces ('' for a new cell, or if not found)
+function notebookCell(json: string, e: Loose): string {
+  if (str(e, 'edit_mode') === 'insert') return ''
+  try {
+    const nb = JSON.parse(json) as { cells?: { id?: string; source?: string | string[] }[] }
+    const id = str(e, 'cell_id')
+    const cell = nb.cells?.find(c => c.id === id) ?? (/^\d+$/.test(id) ? nb.cells?.[Number(id)] : undefined)
+    const src = cell?.source
+    return Array.isArray(src) ? src.join('') : (src ?? '')
+  } catch {
+    return ''
+  }
+}
+
+// Binary payloads (the base64 of an image or PDF the Read tool returns, an MCP image
+// block's data) are not run through the text rules: masking random base64 would corrupt
+// it. Only payload fields are treated so, never a `text` field, whatever type or mime
+// type the block claims. A payload that decodes to text (a `.env` served as
+// octet-stream) is filtered as that text; one that decodes to binary still gets the
+// known-values layer.
 const BASE64 = /^[A-Za-z0-9+/_-]+={0,2}$/
 const BINARY_KEYS = new Set(['base64', 'data', 'blob'])
-
-function isMedia(o: Record<string, unknown>): boolean {
-  const type = typeof o.type === 'string' ? o.type : ''
-  const mime = [o.mimeType, o.media_type, o.mediaType, o.type].find(m => typeof m === 'string' && m.includes('/')) as string | undefined
-  const src = o.source as Record<string, unknown> | undefined
-  if (type === 'document' && src && typeof src === 'object' && src.type === 'text') return false // a text document
-  return MEDIA_TYPE.test(type) || (mime !== undefined && MEDIA_MIME.test(mime))
-}
 
 // A base64 string that decodes to text: filtered as that text, re-encoded when masked
 function walkBase64(s: string, opts: Options, tally: { n: number }): string {
@@ -83,7 +96,12 @@ function walkBase64(s: string, opts: Options, tally: { n: number }): string {
   } catch {
     return s
   }
-  if (/[\x00-\x08\x0e-\x1f\ufffd]/.test(text)) return s // not text: binary
+  if (/[\x00-\x08\x0e-\x1f\ufffd]/.test(text)) {
+    // binary: only values already known, which cannot corrupt it by chance
+    const k = maskKnownOnly(s)
+    tally.n += k.count
+    return k.text
+  }
   const r = redact(text, opts)
   if (r.count === 0) return s
   tally.n += r.count
@@ -101,7 +119,6 @@ function walk(v: unknown, opts: Options, tally: { n: number }): unknown {
   if (Array.isArray(v)) return v.map(x => walk(x, opts, tally))
   if (v && typeof v === 'object') {
     const src = v as Record<string, unknown>
-    if (isMedia(src)) return v
     const o: Record<string, unknown> = {}
     for (const [k, x] of Object.entries(src)) {
       if (BINARY_KEYS.has(k) && typeof x === 'string' && x.length > 256 && BASE64.test(x.replace(/\s+/g, ''))) {
@@ -119,6 +136,14 @@ const NOTE = (n: number) =>
   `secret-filter masked ${n} secret-looking value(s) in this output as ${MASK}:<id>]. ` +
   `Do not try to recover them. To keep such a value when editing this same file, copy its placeholder exactly into Edit/Write: ` +
   `it is restored to the real value on write, in the file it was read from only.`
+
+// A result already masked where the tool ran still needs the note for the model
+const PH_ALL = /\[REDACTED:[0-9a-f]{8}\]/g
+function withNote<R extends { result?: unknown; context?: readonly string[] }>(ran: R): R {
+  const n = (JSON.stringify(ran.result ?? '').match(PH_ALL) ?? []).length
+  if (n === 0 || (ran.context ?? []).some(c => c.startsWith('secret-filter masked'))) return ran
+  return { ...ran, context: [...(ran.context ?? []), NOTE(n)] }
+}
 
 // A text that may hold real values (a deny or an error from beneath): masked, or itself
 function masked(text: string, opts: Options): { text: string; count: number } {
@@ -194,27 +219,49 @@ export function isIgnored(rules: readonly Ignore[], path: string): boolean {
 type List = (dir: string) => Promise<{ name: string; kind: string; size: number }[]>
 type ReadText = (path: string) => Promise<string>
 
-/** Secret files under `root`, nearest first (the project's own `.env` before a sub-folder's). */
+/**
+ * Whether git tracks `rel` in this index text (`.git/index`, read as text). An entry's
+ * path is preceded by its flags, whose low byte is the path's length (or 0 with the
+ * extended flags of index v3), and followed by a NUL.
+ */
+export function isTracked(index: string, rel: string): boolean {
+  for (let i = index.indexOf(rel + '\0'); i !== -1; i = index.indexOf(rel + '\0', i + 1)) {
+    const prev = i > 0 ? index.charCodeAt(i - 1) : -1
+    if (prev === (rel.length & 0xff) || prev === 0) return true
+  }
+  return false
+}
+
+type Repo = { root: string; rules: Ignore[]; index: string }
+
+/**
+ * Secret files under `root`, nearest first (the project's own `.env` before a sub-folder's).
+ * Inside a git repository (each one its own, nested ones too) a file is taken only when
+ * git ignores it and does not track it: a committed one is the repository's, not yours.
+ */
 export async function findSecretFiles(list: List, read: ReadText, root: string): Promise<string[]> {
   const out: string[] = []
-  const rules: Ignore[] = []
-  let isRepo = false
-  let queue: { dir: string; depth: number }[] = [{ dir: root, depth: 0 }]
+  let queue: { dir: string; depth: number; repo?: Repo }[] = [{ dir: root, depth: 0 }]
   let dirs = 0
   while (queue.length > 0 && out.length < MAX_FILES && dirs < MAX_DIRS) {
     const next: typeof queue = []
-    for (const { dir, depth } of queue) {
+    for (const item of queue) {
       if (++dirs > MAX_DIRS) break
+      const { dir, depth } = item
       const entries = await list(dir).catch(() => [])
-      if (depth === 0) isRepo = entries.some(en => en.name === '.git')
-      if (isRepo && entries.some(en => en.name === '.gitignore' && en.kind === 'file')) {
-        rules.push(...parseGitignore(await read(`${dir}/.gitignore`).catch(() => ''), dir))
+      let repo = item.repo
+      if (entries.some(en => en.name === '.git')) {
+        repo = { root: dir, rules: [], index: await read(`${dir}/.git/index`).catch(() => '') }
+      }
+      if (repo && entries.some(en => en.name === '.gitignore' && en.kind === 'file')) {
+        repo.rules.push(...parseGitignore(await read(`${dir}/.gitignore`).catch(() => ''), dir))
       }
       for (const en of entries) {
         const path = `${dir}/${en.name}`
-        if (en.kind === 'dir' && !SKIP_DIRS.has(en.name) && depth < MAX_DEPTH) next.push({ dir: path, depth: depth + 1 })
-        else if (en.kind === 'file' && en.size <= MAX_BYTES && isEnvFile(path) && (!isRepo || isIgnored(rules, path))) {
-          if (out.length < MAX_FILES) out.push(path)
+        if (en.kind === 'dir' && !SKIP_DIRS.has(en.name) && depth < MAX_DEPTH) next.push({ dir: path, depth: depth + 1, repo })
+        else if (en.kind === 'file' && en.size <= MAX_BYTES && isEnvFile(path) && out.length < MAX_FILES) {
+          const rel = repo ? path.slice(repo.root.length + 1) : ''
+          if (!repo || (isIgnored(repo.rules, path) && !isTracked(repo.index, rel))) out.push(path)
         }
       }
     }
@@ -232,16 +279,20 @@ const PERSON = new Set(['composer', 'bridge', 'sdk'])
 
 type Block = { type: string; [k: string]: unknown }
 
+// A row that shows a secret file's content (an attachment naming its `file_path`) is in env mode
+const FILE_PATH = /"?(?:file_path|filePath|path)"?\s*[:=]\s*"([^"\n]+)"/g
+const rowOptions = (text: string): Options => ({ envMode: [...text.matchAll(FILE_PATH)].some(m => isEnvFile(m[1]!)) })
+
 function scrubBlocks(blocks: readonly Block[], tally: { n: number }): Block[] {
   return blocks.map(b => {
     if (b.type === 'text' && typeof b.text === 'string') {
-      const r = redact(b.text)
+      const r = redact(b.text, rowOptions(b.text))
       tally.n += r.count
       return r.count ? { ...b, text: r.text } : b
     }
     if (b.type === 'tool_result') {
       if (typeof b.content === 'string') {
-        const r = redact(b.content)
+        const r = redact(b.content, rowOptions(b.content))
         tally.n += r.count
         return r.count ? { ...b, content: r.text } : b
       }
@@ -258,6 +309,14 @@ function scrubBlocks(blocks: readonly Block[], tally: { n: number }): Block[] {
 export const register: Register = on => {
   // Writes whose input now holds real values: auto mode's classifier is not asked about them
   const restoredCalls = new Set<string>()
+
+  // @-mentions: no tool.call is raised for them, so a secret file is not read that way;
+  // Claude can Read it, masked. Every other attachment's text is masked.
+  on('prompt.mention', ($, e, next) =>
+    isEnvFile(String((e as unknown as { path?: string }).path ?? ''))
+      ? { deny: 'secret-filter: secret files are not attached through @-mentions; ask Claude to Read the file (its values are masked).' }
+      : next(e),
+  ).catch((_$, e, next) => (next.called ? next(e) : { deny: 'secret-filter failed; mention not read.' }))
 
   // 0) Session start: learn the values in the project's secret files (.env*, .npmrc, ...),
   //    so they are masked wherever they show up, also base64 / URL-encoded.
@@ -289,20 +348,20 @@ export const register: Register = on => {
     const opts = options(loose)
     if (ran.deny !== undefined) {
       // a deny from beneath (another plugin, a scanner) may quote the output
-      const r = masked(ran.deny, opts)
+      const r = withBudget(BUDGET_MS, () => masked(ran.deny, opts))
       return r.count === 0 ? ran : { deny: r.text }
     }
     if (ran.isError === true) {
       // a failed call's output (non-zero exit) is masked too; the model reads it as the deny text
-      const r = masked(ran.text ?? '', opts)
+      const r = withBudget(BUDGET_MS, () => masked(ran.text ?? '', opts))
       if (r.count === 0) return ran
       $.ui.toast(`secret-filter: masked ${r.count} value(s) in ${e.tool} error output`)
       return { deny: r.text }
     }
 
     const tally = { n: 0 }
-    const result = walk(ran.result, opts, tally)
-    if (tally.n === 0) return ran
+    const result = withBudget(BUDGET_MS, () => walk(ran.result, opts, tally))
+    if (tally.n === 0) return withNote(ran) // masked beneath (tool.run): its note does not come up
 
     $.ui.toast(`secret-filter: masked ${tally.n} value(s) in ${e.tool} output`)
     return { result: result as typeof ran.result, context: [...(ran.context ?? []), NOTE(tally.n)] }
@@ -339,6 +398,32 @@ export const register: Register = on => {
       }
     }
 
+    // ... and only where it already was in that file: never into a new line
+    const values = [...new Set(WRITE_FIELDS.flatMap(k => (typeof loose[k] === 'string' ? restore(loose[k] as string, file).values : [])))]
+    if (values.length > 0) {
+      let newText: string
+      let source: string
+      if (loose.tool === 'Edit') {
+        newText = rewritten.new_string ?? ''
+        source = rewritten.old_string ?? '' // the tool checks old_string is in the file
+      } else if (loose.tool === 'Write') {
+        newText = rewritten.content ?? ''
+        source = await $.fs.read(file).catch(() => '')
+      } else {
+        newText = rewritten.new_source ?? ''
+        source = notebookCell(await $.fs.read(file).catch(() => ''), loose)
+      }
+      const moved = movedValues(newText, source, values)
+      if (moved.length > 0) {
+        return {
+          deny:
+            `secret-filter: ${moved.length} masked value(s) would be written to a new place in ${file}. A placeholder is only restored where ` +
+            `its value already is (the same line, or a part of it), so it cannot be moved into a new line, command or URL. ` +
+            `Keep the line that holds it as it is, or ask the user to make this change.`,
+        }
+      }
+    }
+
     const restoredAny = WRITE_FIELDS.some(k => typeof loose[k] === 'string' && rewritten[k] !== loose[k])
     if (restoredAny) {
       for (const k of WRITE_FIELDS) if (typeof loose[k] === 'string') pinRestored(loose[k] as string)
@@ -349,23 +434,37 @@ export const register: Register = on => {
     try {
       const ran = await next({ ...e, ...rewritten } as typeof e)
       if (ran.deny !== undefined) {
-        const r = masked(ran.deny, opts)
+        const r = withBudget(BUDGET_MS, () => masked(ran.deny, opts))
         return r.count === 0 ? ran : { deny: r.text }
       }
       if (ran.isError === true) {
         // an error may echo the input, where placeholders are now real values: mask it
-        const r = masked(ran.text ?? '', opts)
+        const r = withBudget(BUDGET_MS, () => masked(ran.text ?? '', opts))
         return r.count === 0 ? ran : { deny: r.text }
       }
 
       const tally = { n: 0 }
-      const result = walk(ran.result, opts, tally)
-      if (tally.n === 0) return ran
+      const result = withBudget(BUDGET_MS, () => walk(ran.result, opts, tally))
+      if (tally.n === 0) return withNote(ran) // masked beneath (tool.run): its note does not come up
       return { result: result as typeof ran.result, context: [...(ran.context ?? []), NOTE(tally.n)] }
     } finally {
       if (e.tool_use_id) restoredCalls.delete(e.tool_use_id)
     }
   }).catch((_$, e, next) => (next.called ? { deny: 'secret-filter failed; write result withheld.' } : next(e)))
+
+  // 2b) Where the tool runs: mask its result there too, so what runs beneath and after this
+  //     mod (PostToolUse hooks, plugins below) sees placeholders. The tool.call hooks above
+  //     mask again: a plugin beneath may answer a call without running a tool.
+  on('tool.run', { tool: [...TOOLS, ...WRITERS] }, async ($, e, next) => {
+    const ran = await next(e)
+    if (ran.deny !== undefined) return ran
+    const opts = options(e as unknown as Loose)
+    const tally = { n: 0 }
+    const result = withBudget(BUDGET_MS, () => walk(ran.result, opts, tally))
+    if (tally.n === 0) return ran
+    $.ui.toast(`secret-filter: masked ${tally.n} value(s) in ${e.tool} output`)
+    return { result: result as typeof ran.result, context: [...(ran.context ?? []), NOTE(tally.n)] }
+  }).catch((_$, e, next) => (next.called ? { deny: 'secret-filter failed; output withheld.' } : next(e)))
 
   // 3) Auto mode: a write that now holds real values is put to the person, not to the
   //    classifier, which would read (and may send) its input.
@@ -382,7 +481,7 @@ export const register: Register = on => {
     if (origin.kind && PERSON.has(origin.kind)) return next(e)
     if (e.door === 'tool-result' && origin.kind === 'tool' && origin.tool && handledHere(origin.tool)) return next(e)
     const tally = { n: 0 }
-    const content = scrubBlocks(e.message.content as Block[], tally)
+    const content = withBudget(BUDGET_MS, () => scrubBlocks(e.message.content as Block[], tally))
     if (tally.n === 0) return next(e)
     return next({ ...e, message: { ...e.message, content } })
   }).catch((_$, e, next) => {

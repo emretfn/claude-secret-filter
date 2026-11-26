@@ -4,7 +4,7 @@
 // A placeholder literal is built at run time too: the mod refuses to write one it does not know.
 import { expect, test } from 'claude-code/testing'
 import { GITLEAKS_RULES } from '../hooks/gitleaks-rules'
-import { gitleaksSkipped, hasPlaceholder, isSecretName, looksRandom, redact, remember, restore, seedEnvText, sha256hex } from '../hooks/redact'
+import { gitleaksSkipped, hasPlaceholder, isSecretName, looksRandom, redact, remember, restore, seedEnvText, sha256hex, withBudget } from '../hooks/redact'
 
 const ALNUM = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789'
 const B32 = 'abcdefghijklmnopqrstuvwxyz234567'
@@ -249,4 +249,24 @@ test('placeholder ids do not reveal the value (keyed per session)', () => {
   const id = /\[REDACTED:([0-9a-f]{8})\]/.exec(redact(v).text)![1]!
   expect(id).not.toBe(sha256hex(v.slice(9, -1)).slice(0, 8))
   expect(sha256hex('abc')).toBe('ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad')
+})
+
+test('rules keyed to words run around those words: a long text full of them stays fast', () => {
+  const kws = [...new Set(GITLEAKS_RULES.flatMap(r => r.keywords ?? []))].join(' ')
+  for (const c of [kws + ' ' + 'a'.repeat(200000), (kws + ' ').repeat(20) + 'ab1_'.repeat(50000)]) {
+    const t0 = Date.now()
+    redact(c)
+    expect(Date.now() - t0).toBeLessThan(2000)
+  }
+})
+
+test('past its budget, redaction throws (the hook then withholds the output)', () => {
+  const big = Array.from({ length: 20000 }, (_, i) => `line ${i} token=${rnd(30)}`).join('\n')
+  expect(() => withBudget(1, () => redact(big))).toThrow()
+})
+
+test('a secret kept in place in a gitleaks keyword window is still masked', () => {
+  const tok = 'gh' + 'p_' + rnd(36)
+  const text = 'x '.repeat(10000) + `github token ${tok} ` + 'y '.repeat(10000)
+  expect(redact(text).text.includes(tok)).toBe(false)
 })

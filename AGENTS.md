@@ -13,9 +13,13 @@ the project's secret files, and shows toasts. Real values stay in module memory.
   same pull request, so a reviewer sees it next to the code that needs it.
 - Persisting the vault is out of scope: no disk writes, no `$.store`, no `$.state`.
 - A real value is restored only into a file it was read from with `Read` (its
-  sources in the vault), never under `.git/`. Restoring is the one place the mod puts
+  sources in the vault), only where it already was in that file (`movedValues`: its
+  line, or part of it), never under `.git/`. Restoring is the one place the mod puts
   a secret back into the world: a change that widens it needs a test showing a
-  placeholder cannot reach another file, a command or a URL.
+  placeholder cannot reach another file, a new line, a command or a URL.
+- Redaction is bounded in time (`withBudget`): past it the hook throws and its
+  `.catch` withholds the output. A hook that runs past the engine's budget is skipped
+  and the raw result passes, so slow code is a leak, not only a slowdown.
 
 ## Shipped files and versions
 
@@ -62,6 +66,13 @@ When the mod is active in your own session, it masks this repo's source as you r
 it: regex literals and test fixtures show up as placeholders. Edit through them, as
 `Edit`/`Write` restore the real text, or re-read the file after the mod reloads
 (placeholders from before a reload are unknown and the write is refused).
+
+## Guard scripts
+
+On a pull request, CI runs `scripts/check-no-egress.py` and
+`scripts/check-version-bump.py` from the base branch, so a pull request cannot loosen
+the checks it is judged by. Change a guard script (or its allowlists) in a pull
+request of its own, merged before the change that needs it.
 
 ## Pull requests
 
