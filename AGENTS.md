@@ -12,12 +12,18 @@ the project's secret files, and shows toasts. Real values stay in module memory.
   A new `$` call, import or file under `hooks/` means editing that allowlist in the
   same pull request, so a reviewer sees it next to the code that needs it.
 - Persisting the vault is out of scope: no disk writes, no `$.store`, no `$.state`.
+- A real value is restored only into a file it was read from with `Read` (its
+  sources in the vault), never under `.git/`. Restoring is the one place the mod puts
+  a secret back into the world: a change that widens it needs a test showing a
+  placeholder cannot reach another file, a command or a URL.
 
 ## Shipped files and versions
 
-**Shipped files** are everything under `hooks/` and `.claude-plugin/`: what an
-installed copy runs. Installed copies update by version, so every pull request that
-changes a shipped file raises `version` in `.claude-plugin/plugin.json`:
+**Shipped files** are every file except docs, tests, scripts, CI and the repository's
+notes (the list is `NOT_SHIPPED` in `scripts/check-version-bump.py`): the marketplace
+installs the whole repository. A new top-level entry must be added to `TOP_LEVEL` in
+`scripts/check-no-egress.py`. Installed copies update by version, so every pull
+request that changes a shipped file raises `version` in `.claude-plugin/plugin.json`:
 
 - PATCH: a fix, a false-positive fix, a rule tweak.
 - MINOR: a new layer, a new rule set, a new tool covered.

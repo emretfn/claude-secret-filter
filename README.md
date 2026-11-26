@@ -35,8 +35,9 @@ Nothing else needs to be installed: gitleaks' rules ship converted, as a file.
 ![How secret-filter sits between Claude and its tools: tool output goes through the read hook and the redaction engine, so Claude only sees placeholders; real values stay in an in-memory vault, seeded from .env files, and the write hook puts them back when Claude edits a file.](docs/architecture.png)
 
 - **Reading.** Every call to `Bash`, `Read`, `WebFetch`, `WebSearch` or an MCP tool runs as usual. Its output goes through the redaction engine before Claude sees it, failed calls included. Claude reads placeholders where the secrets were.
-- **The vault.** Each masked value is kept in the mod's memory under its placeholder id. Values from the project's `.env`-style files are added at session start.
-- **Writing.** When Claude edits a file and copies a placeholder into `Edit`, `Write` or `NotebookEdit`, the write hook swaps the real value back in before the write. What the tool returns is masked again.
+- **Everything else.** Every other row the conversation keeps (other tools such as `Monitor`, background task and subagent results, notifications, attachments) goes through the same engine before the model or the transcript file reads it. Only your own prompt and Claude's own reply are left as written.
+- **The vault.** Each masked value is kept in the mod's memory under its placeholder id, with the files it was read from. Values from the project's git-ignored `.env`-style files are learned at session start.
+- **Writing.** When Claude edits a file and copies a placeholder into `Edit`, `Write` or `NotebookEdit`, the write hook swaps the real value back in before the write, **only in a file the value was read from**. What the tool returns is masked again.
 
 The diagram sources are in [`docs/`](docs/) (HTML with inline SVG).
 
@@ -61,10 +62,20 @@ from env files.
 
 ## Placeholders and edits
 
-- The same value always gets the same placeholder, and real values are kept in the
-  mod's memory only: never written to disk, never sent to the model.
+- The same value always gets the same placeholder within a session, and real values
+  are kept in the mod's memory only: never written to disk, never sent to the model.
+  Ids are a keyed hash with a random per-session key, so a placeholder that ends up
+  somewhere public cannot be checked against guessed passwords.
 - For `Edit`, `Write` and `NotebookEdit`, placeholders in the input are turned back
-  into the real values just before the write. The tool's result is masked again.
+  into the real values just before the write. The tool's result is masked again,
+  and a restored value stays masked in every later output, whatever it looks like.
+- **A value is only restored into a file it was read with `Read` from**, and never
+  under `.git/`. A placeholder copied into another file, a new script or a URL is
+  refused, so a prompt injection cannot make the mod write a secret somewhere it
+  can be run or sent. Command output (`cat a b`) names no file for sure, so its
+  placeholders are restored nowhere. To move a secret to a new place, add it yourself.
+- In auto mode, a write that restores real values is put to you instead of to the
+  classifier, which would read its input.
 - A placeholder the mod does not know (after a reload) makes the write refuse
   instead of writing a placeholder into a file. Reading the file again fixes it.
 - A `Bash` command that holds a placeholder is refused: `sed` or a heredoc would
@@ -88,14 +99,20 @@ This is defense in depth, not a guarantee. It does not:
 
 - stop a command from **sending** a secret somewhere (`curl -d "$TOKEN" …`): it only
   filters what Claude reads.
-- see `@file` mentions in your prompt: Claude Code expands them before any hook runs.
+- mask what you type or paste into the prompt yourself, or the output of a `!`
+  command you run: those are yours, kept as written.
+- hide a restored value from what runs beneath the write: the permission dialog
+  shows it to you, and your own classic `PreToolUse` hooks receive it.
 - catch every short random token: the entropy layer misses about 20% of 24-char
   tokens and 1–5% of 32+ char tokens. Known formats are always caught.
 - catch secrets that are split, reversed or hex-encoded.
 
 Seeding reads up to 50 secret files, 4 directory levels deep from the session's
-directory. Plain words, code identifiers and plain URLs are not learned from them,
-so a cloned repository cannot plant "decoys" that hide ordinary code.
+directory, nearest first. In a git repository it reads only files git ignores: a
+secret file committed to a cloned repository is not yours, and could plant "decoys"
+that hide ordinary code. Plain words, code identifiers, plain URLs and values that
+read like code are not learned, and seeds have a budget of their own (500 values, 100
+per file), so they cannot crowd out what is learned while working.
 
 ## Development
 
