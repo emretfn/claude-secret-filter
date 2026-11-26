@@ -1,0 +1,44 @@
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+# The workflow token can read the repository and nothing else.
+permissions:
+  contents: read
+
+jobs:
+  guard:
+    name: guard
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: No egress in the mod's code
+        run: python3 scripts/check-no-egress.py
+      - name: gitleaks rules are generated, not hand-edited
+        run: |
+          python3 scripts/gen-gitleaks-rules.py
+          git diff --exit-code -- hooks/gitleaks-rules.ts
+
+  test:
+    name: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+      - name: Install Claude Code (pinned)
+        run: npm install -g @anthropic-ai/claude-code@2.1.332
+      - name: Validate, and check the engine calls the module makes
+        run: |
+          claude plugin validate --strict --json . > "$RUNNER_TEMP/validate.json"
+          python3 scripts/check-no-egress.py --validate "$RUNNER_TEMP/validate.json"
+      - name: Tests
+        run: claude plugin test .

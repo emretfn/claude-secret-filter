@@ -1,0 +1,13 @@
+{
+  "name": "claude-secret-filter",
+  "owner": {
+    "name": "emretfn"
+  },
+  "plugins": [
+    {
+      "name": "secret-filter",
+      "source": "./"
+    }
+  ],
+  "description": "secret-filter: masks secrets in Claude Code tool output before the model reads it"
+}
