@@ -30,7 +30,20 @@ Nothing else needs to be installed: gitleaks' rules ship converted, as a file.
 > early access and may change between releases. It was built and tested on Claude
 > Code 2.1.332. Classic `PostToolUse` hooks cannot do some of what it does (see below).
 
+## How it works
+
+![How secret-filter sits between Claude and its tools: tool output goes through the read hook and the redaction engine, so Claude only sees placeholders; real values stay in an in-memory vault, seeded from .env files, and the write hook puts them back when Claude edits a file.](docs/architecture.png)
+
+- **Reading.** Every call to `Bash`, `Read`, `WebFetch`, `WebSearch` or an MCP tool runs as usual. Its output goes through the redaction engine before Claude sees it, failed calls included. Claude reads placeholders where the secrets were.
+- **The vault.** Each masked value is kept in the mod's memory under its placeholder id. Values from the project's `.env`-style files are added at session start.
+- **Writing.** When Claude edits a file and copies a placeholder into `Edit`, `Write` or `NotebookEdit`, the write hook swaps the real value back in before the write. What the tool returns is masked again.
+
+The diagram sources are in [`docs/`](docs/) (HTML with inline SVG).
+
 ## What it masks
+
+![The redaction engine, layer by layer: known values, known formats, secret-named fields, entropy and env mode, in that order.](docs/layers.png)
+
 
 Every string in the output of `Bash`, `Read`, `WebFetch`, `WebSearch` and all MCP
 tools goes through these layers, in order:
