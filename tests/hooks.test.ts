@@ -33,6 +33,29 @@ test('a failed command (non-zero exit) is masked too', async ($, on) => {
   expect(textOf(r)).toMatch(PH)
 })
 
+test('an image the Read tool returns is left byte-for-byte alone', async ($, on) => {
+  // random base64, as an image payload: full of entropy-layer and gitleaks look-alikes
+  const B64 = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/'
+  const base64 = Array.from({ length: 8192 }, () => B64[Math.floor(Math.random() * 64)]).join('')
+  const image = { type: 'image', file: { base64, type: 'image/png', originalSize: 6144 } }
+  on('tool.call', { tool: 'Read' }, () => ({ result: image }) as never)
+  const r = await $.tool.call({ tool: 'Read', file_path: '/app/docs/diagram.png' })
+  expect(JSON.stringify(r.result)).toBe(JSON.stringify(image))
+  expect(r.context ?? []).toEqual([])
+})
+
+test('an MCP image block is left alone, its text block is still masked', async ($, on) => {
+  const secret = ghToken()
+  const data = rnd(4096)
+  on('tool.call', { tool: 'mcp__shots__capture' as never }, () => ({
+    result: [{ type: 'image', data, mimeType: 'image/png' }, { type: 'text', text: `token ${secret}` }],
+  }) as never)
+  const r = await $.tool.call({ tool: 'mcp__shots__capture' } as never)
+  const out = JSON.stringify(r.result)
+  expect(out.includes(data)).toBe(true)
+  expect(out.includes(secret)).toBe(false)
+})
+
 test('reading a .env file masks every value', async ($, on) => {
   on('tool.call', { tool: 'Read' }, () => ({
     result: { type: 'text', file: { filePath: '/app/.env', content: 'NODE_ENV=dev\nDB_HOST=db.internal.example\nPORT=5432', numLines: 3, startLine: 1, totalLines: 3 } },

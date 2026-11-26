@@ -36,6 +36,16 @@ function envMode(e: Loose): boolean {
   }
 }
 
+// Binary content (an image or PDF the Read tool returns, an MCP image block) is left
+// alone: masking its base64 would corrupt it, and text rules cannot hide a secret in it.
+const BINARY_KEYS = new Set(['base64', 'data', 'blob'])
+function isBinary(o: Record<string, unknown>): boolean {
+  const type = typeof o.type === 'string' ? o.type : ''
+  const mime = [o.mimeType, o.media_type, o.mediaType].find(m => typeof m === 'string') as string | undefined
+  return type === 'image' || type === 'pdf' || type === 'audio' || typeof o.base64 === 'string' ||
+    (mime !== undefined && !/^(?:text\/|application\/(?:json|xml|javascript|x-yaml|yaml|toml))/i.test(mime))
+}
+
 // Masks every string inside a result, keeping its shape
 function walk(v: unknown, opts: Options, tally: { n: number }): unknown {
   if (typeof v === 'string') {
@@ -45,8 +55,12 @@ function walk(v: unknown, opts: Options, tally: { n: number }): unknown {
   }
   if (Array.isArray(v)) return v.map(x => walk(x, opts, tally))
   if (v && typeof v === 'object') {
+    const src = v as Record<string, unknown>
+    if (isBinary(src)) return v
     const o: Record<string, unknown> = {}
-    for (const [k, x] of Object.entries(v)) o[k] = walk(x, opts, tally)
+    for (const [k, x] of Object.entries(src)) {
+      o[k] = BINARY_KEYS.has(k) && typeof x === 'string' && x.length > 256 && !/\s/.test(x.slice(0, 256)) ? x : walk(x, opts, tally)
+    }
     return o
   }
   return v
