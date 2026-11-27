@@ -24,6 +24,7 @@ A rule scoped to file paths (`path`) runs only when the output's file is known a
 (the Read tool's file, or a file named in a Bash command); rules that are a path alone
 (no regex) are skipped.
 """
+import hashlib
 import json
 import re
 import sys
@@ -32,6 +33,9 @@ import urllib.request
 from pathlib import Path
 
 PINNED_TAG = "v8.30.1"
+# SHA-256 of that release's config/gitleaks.toml: a tag can be moved, the bytes cannot.
+# Updating the tag means updating this hash in the same pull request.
+PINNED_SHA256 = "e163e53b9e7e8a8511e77271e2b323ed057759542a6d988258afe3a1fa329caf"
 URL = "https://raw.githubusercontent.com/gitleaks/gitleaks/{tag}/config/gitleaks.toml"
 OUT = Path(__file__).resolve().parent.parent / "hooks" / "gitleaks-rules.ts"
 
@@ -125,6 +129,8 @@ def main() -> None:
     else:
         with urllib.request.urlopen(source) as r:
             raw = r.read()
+    if tag == PINNED_TAG and hashlib.sha256(raw).hexdigest() != PINNED_SHA256:
+        sys.exit(f"gitleaks.toml for {tag} does not match PINNED_SHA256: refusing to generate")
     cfg = tomllib.loads(raw.decode())
 
     rules, skipped = [], []

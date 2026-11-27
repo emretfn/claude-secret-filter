@@ -4,7 +4,7 @@
 // A placeholder literal is built at run time too: the mod refuses to write one it does not know.
 import { expect, test } from 'claude-code/testing'
 import { GITLEAKS_RULES } from '../hooks/gitleaks-rules'
-import { gitleaksSkipped, hasPlaceholder, isSecretName, looksRandom, redact, remember, restore, seedEnvText, sha256hex } from '../hooks/redact'
+import { gitleaksSkipped, hasPlaceholder, isEnvFile, isSecretName, looksRandom, redact, remember, restore, seedEnvText, sha256hex, withBudget } from '../hooks/redact'
 
 const ALNUM = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789'
 const B32 = 'abcdefghijklmnopqrstuvwxyz234567'
@@ -249,4 +249,90 @@ test('placeholder ids do not reveal the value (keyed per session)', () => {
   const id = /\[REDACTED:([0-9a-f]{8})\]/.exec(redact(v).text)![1]!
   expect(id).not.toBe(sha256hex(v.slice(9, -1)).slice(0, 8))
   expect(sha256hex('abc')).toBe('ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad')
+})
+
+test('rules keyed to words run around those words: a long text full of them stays fast', () => {
+  const kws = [...new Set(GITLEAKS_RULES.flatMap(r => r.keywords ?? []))].join(' ')
+  for (const c of [kws + ' ' + 'a'.repeat(200000), (kws + ' ').repeat(20) + 'ab1_'.repeat(50000)]) {
+    const t0 = Date.now()
+    redact(c)
+    expect(Date.now() - t0).toBeLessThan(2000)
+  }
+})
+
+test('past its budget, redaction throws (the hook then withholds the output)', () => {
+  const big = Array.from({ length: 20000 }, (_, i) => `line ${i} token=${rnd(30)}`).join('\n')
+  expect(() => withBudget(1, () => redact(big))).toThrow()
+})
+
+test('a secret kept in place in a gitleaks keyword window is still masked', () => {
+  const tok = 'gh' + 'p_' + rnd(36)
+  const text = 'x '.repeat(10000) + `github token ${tok} ` + 'y '.repeat(10000)
+  expect(redact(text).text.includes(tok)).toBe(false)
+})
+
+test('non-ASCII text before a secret does not shift the keyword spans', () => {
+  const tok = 'gh' + 'p_' + rnd(36)
+  const text = 'İ'.repeat(700) + ' ' + 'x '.repeat(5000) + `github token ${tok} ` + 'y '.repeat(5000)
+  expect(redact(text).text.includes(tok)).toBe(false)
+})
+
+test('PEM keys: masked whole, and a text of BEGIN lines with no END is quick', () => {
+  const body = Array.from({ length: 10 }, () => rnd(64)).join('\n')
+  const pem = `-----BEGIN RSA PRIVATE KEY-----\n${body}\n-----END RSA PRIVATE KEY-----`
+  expect(redact(`key:\n${pem}\nafter`).text).toMatch(/^key:\n\[REDACTED:[0-9a-f]{8}\]\nafter$/)
+  const hostile = '-----BEGIN RSA PRIVATE KEY-----\n'.repeat(30000)
+  const t0 = Date.now()
+  redact(hostile)
+  expect(Date.now() - t0 < 2000).toBe(true)
+})
+
+test('a line full of `curl` is quick, and curl credentials are still masked', () => {
+  const t0 = Date.now()
+  redact('curl '.repeat(40000))
+  expect(Date.now() - t0 < 2000).toBe(true)
+  const pw = rnd(20)
+  const tok = rnd(32)
+  const r = redact(`curl -u admin:${pw} https://x.example\ncurl -H "Authorization: Bearer ${tok}" https://x.example`).text
+  expect(r.includes(pw) || r.includes(tok)).toBe(false)
+  expect(r).toMatch(/curl -u admin:\[REDACTED/)
+})
+
+test('secret fields in other notations: escaped JSON, XML, flags, SQL, PHP', () => {
+  const v = () => rnd(18)
+  const cases: [string, string][] = []
+  const add = (f: (s: string) => string) => { const s = v(); cases.push([f(s), s]) }
+  add(s => `{"SecretString":"{\\"username\\":\\"app\\",\\"password\\":\\"${s}\\"}"}`)
+  add(s => `<config><password>${s}</password></config>`)
+  add(s => `<add key="DbPassword" value="${s}" />`)
+  add(s => `deploy --db-password ${s} --region eu`)
+  add(s => `tool --api-key=${s}`)
+  add(s => `mysql -u root -p${s} app`)
+  add(s => `CREATE USER app IDENTIFIED BY '${s}';`)
+  add(s => `ALTER ROLE app WITH PASSWORD '${s}';`)
+  add(s => `define('DB_PASSWORD', '${s}');`)
+  for (const [text, s] of cases) expect([text, redact(text).text.includes(s)]).toEqual([text, false])
+})
+
+test('other notations leave ordinary code alone', () => {
+  const keep = [
+    '<name>Release build</name>',
+    '<add key="LogLevel" value="Information" />',
+    'npm run build --max-tokens 4096 --password-file ./pw.txt',
+    'docker run -u 1000:1000 image',
+    "define('APP_NAME', 'Example shop');",
+    'tool --token $GITHUB_TOKEN',
+    'curl -H "Accept: application/json" https://x.example',
+  ]
+  for (const k of keep) expect(redact(k).text).toBe(k)
+})
+
+test('env mode: .envrc and a backup .env~ are secret files; a very long env line stays in env mode', () => {
+  expect(isEnvFile('/app/.envrc')).toBe(true)
+  expect(isEnvFile('/app/.env~')).toBe(true)
+  const tail = 'tail' + rnd(12).toLowerCase()
+  const long = 'CERT=' + 'a'.repeat(25000) + tail
+  const out = redact(long, { envMode: true }).text
+  expect(out.includes(tail)).toBe(false)
+  expect(out.startsWith('CERT=[REDACTED:')).toBe(true)
 })

@@ -18,8 +18,11 @@ NOT_SHIPPED = ("docs/", "tests/", "scripts/", ".github/", ".claude/", ".gitignor
 MANIFEST = ".claude-plugin/plugin.json"
 
 
+ROOT = sys.argv[sys.argv.index("--root") + 1] if "--root" in sys.argv else "."
+
+
 def git(*args: str) -> str:
-    return subprocess.run(["git", *args], check=True, capture_output=True, text=True).stdout
+    return subprocess.run(["git", "-C", ROOT, *args], check=True, capture_output=True, text=True).stdout
 
 
 def version_at(ref: str) -> tuple[int, int, int]:
@@ -31,7 +34,8 @@ def version_at(ref: str) -> tuple[int, int, int]:
 
 
 def main() -> None:
-    base = sys.argv[1] if len(sys.argv) > 1 else "origin/main"
+    args = [a for i, a in enumerate(sys.argv[1:], 1) if a != "--root" and sys.argv[i - 1] != "--root"]
+    base = args[0] if args else "origin/main"
     merge_base = git("merge-base", base, "HEAD").strip()
     changed = [p for p in git("diff", "--name-only", merge_base, "HEAD").splitlines() if p]
     shipped = [p for p in changed if not p.startswith(NOT_SHIPPED)]

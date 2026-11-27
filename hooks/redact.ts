@@ -21,6 +21,7 @@ const PLACEHOLDER = /\[REDACTED:[0-9a-f]{8}\]/
 // id -> the real value, and the files it was seen in (the only files it is restored into)
 type Entry = { value: string; sources: Set<string> }
 const vault = new Map<string, Entry>()
+const MAX_VAULT = 50_000
 const idOf = new Map<string, string>()
 
 // SHA-256, synchronous (crypto.subtle is async): ids are a keyed hash, so a placeholder
@@ -72,6 +73,24 @@ const keyedId = (s: string) => sha256hex(KEY + s).slice(0, 8)
 // it may be restored into them.
 let currentSources: readonly string[] = []
 
+// A deadline for the redaction of one tool result (`withBudget`). Past it `redact` throws,
+// and the hook withholds the output: the engine would otherwise give up on the hook and
+// pass the raw result.
+let deadline = Infinity
+export class BudgetExceeded extends Error {}
+const checkBudget = () => {
+  if (Date.now() > deadline) throw new BudgetExceeded('secret-filter: redaction ran out of time')
+}
+export function withBudget<T>(ms: number, fn: () => T): T {
+  const outer = deadline
+  deadline = Math.min(outer, Date.now() + ms)
+  try {
+    return fn()
+  } finally {
+    deadline = outer
+  }
+}
+
 /**
  * Masks a value. `learn`: also mask it wherever it shows up later. Off for the
  * entropy layer, a guess: one false positive there must not spread.
@@ -81,6 +100,8 @@ export function mask(value: string, learn = true): string {
   if (id === undefined) {
     id = keyedId(value)
     while (vault.has(id)) id = keyedId(id + value)
+    // past the cap a value is still masked, but not kept: its placeholder cannot be restored
+    if (vault.size >= MAX_VAULT) return `${MASK}:${id}]`
     vault.set(id, { value, sources: new Set() })
     idOf.set(value, id)
   }
@@ -89,7 +110,9 @@ export function mask(value: string, learn = true): string {
   return `${MASK}:${id}]`
 }
 
-const normPath = (p: string) => p.trim().replace(/\/+/g, '/').replace(/\/(?:\.\/)+/g, '/')
+// Paths compare case-insensitively: macOS and Windows file systems are, and a looser
+// match only matters where the line check in `restore` already holds.
+const normPath = (p: string) => p.replace(/\/+/g, '/').replace(/\/(?:\.\/)+/g, '/').toLowerCase()
 
 export const hasPlaceholder = (text: string) => PLACEHOLDER.test(text)
 
@@ -103,11 +126,12 @@ const hit = (k: string) => hits.set(k, (hits.get(k) ?? 0) + 1)
  * a placeholder copied into a new script, a URL or another file would otherwise carry
  * the real value out. `missing`: placeholders this module does not know.
  */
-export function restore(text: string, target: string): { text: string; missing: string[]; foreign: string[] } {
+export function restore(text: string, target: string): { text: string; missing: string[]; foreign: string[]; values: string[] } {
   const missing: string[] = []
   const foreign: string[] = []
+  const values = new Set<string>()
   const t = normPath(target)
-  const blocked = t === '' || /(?:^|\/)\.git(?:\/|$)/.test(t)
+  const blocked = t === '' || /(?:^|\/)\.git(?:\/|$)/i.test(t)
   const out = text.replace(/\[REDACTED:([0-9a-f]{8})\]/g, (m, id: string) => {
     const en = vault.get(id)
     if (en === undefined) {
@@ -118,17 +142,60 @@ export function restore(text: string, target: string): { text: string; missing: 
       foreign.push(m)
       return m
     }
+    values.add(en.value)
     return en.value
   })
-  return { text: out, missing, foreign }
+  return { text: out, missing, foreign, values: [...values] }
+}
+
+/**
+ * A restored value may only stay where it already was: every line of `after` that holds
+ * it (every block of lines, for a value spanning lines) must be a whole line of `before`,
+ * unchanged, no more often than there. `before` and `after` are the whole file before and
+ * after the write. So a line holding a secret can be kept or deleted, but not edited,
+ * split or copied: the value never lands in a new line such as `curl ...?t=<value>`.
+ * Returns the values that would land somewhere new.
+ */
+export function movedValues(after: string, before: string, values: readonly string[]): string[] {
+  const moved: string[] = []
+  const lineStart = (t: string, i: number) => t.lastIndexOf('\n', i - 1) + 1
+  const lineEnd = (t: string, i: number) => (t.indexOf('\n', i) === -1 ? t.length : t.indexOf('\n', i))
+  // how often `span` is in `t` as whole lines
+  const wholeLines = (t: string, span: string) => {
+    let n = 0
+    for (let i = t.indexOf(span); i !== -1; i = t.indexOf(span, i + 1)) {
+      if ((i === 0 || t[i - 1] === '\n') && (i + span.length === t.length || t[i + span.length] === '\n')) n++
+    }
+    return n
+  }
+  for (const v of values) {
+    if (v === '') continue
+    const need = new Map<string, number>()
+    let lastStart = -1
+    for (let i = after.indexOf(v); i !== -1; i = after.indexOf(v, i + 1)) {
+      const start = lineStart(after, i)
+      if (start === lastStart) continue // the same line, counted once
+      lastStart = start
+      const span = after.slice(start, lineEnd(after, i + v.length))
+      need.set(span, (need.get(span) ?? 0) + 1)
+    }
+    for (const [span, n] of need) {
+      if (wholeLines(before, span) < n) {
+        moved.push(v)
+        break
+      }
+    }
+  }
+  return moved
 }
 
 /** A value that was restored into a file is masked in every later output, whatever it looks like. */
 export function pinRestored(text: string): void {
   for (const m of text.matchAll(/\[REDACTED:([0-9a-f]{8})\]/g)) {
     const v = vault.get(m[1]!)?.value
-    if (v === undefined || v.length < 4 || pinned.has(v)) continue
-    for (const x of [v, b64(v), b64(v, true).replace(/=+$/, ''), encodeURIComponent(v)]) if (x.length >= 4) pinned.add(x)
+    if (v === undefined || v.length < 3 || pinned.has(v)) continue
+    if (v.length < 8) pinnedShort.add(v)
+    for (const x of [v, b64(v), b64(v, true).replace(/=+$/, ''), encodeURIComponent(v)]) if (x.length >= 3) pinned.add(x)
     knownSorted = undefined
   }
 }
@@ -136,20 +203,28 @@ export function pinRestored(text: string): void {
 // ---------------------------------------------------------------------------
 // Values that are obviously not secrets: placeholders, templates, examples.
 const PLACEHOLDER_WORDS =
-  /^(?:password|passwd|passw0rd|changeme|change_me|changeit|example|sample|dummy|test|testing|redacted|secret|token|placeholder|none|null|empty|undefined|default|admin|admin123|root|letmein|qwerty|123456|12345678|your[_-]?\w+|my[_-]?\w+|insert[_-]?\w+|enter[_-]?\w+|todo|tbd|fixme|foo|bar|baz|xxx+|\*+|\.+|-+)$/i
+  /^(?:password|passwd|passw0rd|changeme|change_me|changeit|example|sample|dummy|test|testing|redacted|secret|token|placeholder|none|null|empty|undefined|default|admin|admin123|root|letmein|qwerty|123456|12345678|todo|tbd|fixme|foo|bar|baz|xxx+|\*+|\.+|-+)$/i
 const TEMPLATE =
   /^(?:\$\w+|\$\{[^}]*\}|\$\{\{[^}]*\}\}|\{\{[^}]*\}\}|%\w+%|@\w+@|<[^>]*>|\{\d{0,2}\}|%[+\-# 0]?[a-zA-Z]|\$\(.*\))$/
 const REPEATED = /^(.)\1*$/
+// `your_api_key`, `<insert-token>`-style prose: never with a digit (`my_db_pw7` is a value)
+const PLACEHOLDER_PREFIX = /^(?:your|my|insert|enter)[_-]?[A-Za-z_]+$/i
+// In a secret file every value is real unless it is unmistakably a stand-in:
+// `admin123` or `password` there is a weak password, not an example.
+const PLACEHOLDER_STRICT =
+  /^(?:changeme|change_me|changeit|example|sample|dummy|redacted|placeholder|none|null|empty|undefined|todo|tbd|fixme|xxx+|\*+|\.+|-+)$/i
 
-export function isPlaceholderValue(v: string): boolean {
+export function isPlaceholderValue(v: string, strict = false): boolean {
   const t = v.trim().replace(/^["'`]|["'`]$/g, '')
-  return t === '' || PLACEHOLDER_WORDS.test(t) || TEMPLATE.test(t) || REPEATED.test(t)
+  if (t === '' || TEMPLATE.test(t) || REPEATED.test(t)) return true
+  return strict ? PLACEHOLDER_STRICT.test(t) : PLACEHOLDER_WORDS.test(t) || PLACEHOLDER_PREFIX.test(t)
 }
 
 // ---------------------------------------------------------------------------
 // Layer 0: known values, with encoded variants.
 const known = new Set<string>()
 const pinned = new Set<string>() // restored into a file: masked always (pinRestored)
+const pinnedShort = new Set<string>() // short ones: masked as whole words only, not inside other words
 let knownSorted: string[] | undefined
 // Seeds and values learned while working have budgets of their own, so a repository
 // full of planted values cannot crowd out what is learned later.
@@ -194,6 +269,11 @@ export function remember(value: string): void {
   knownSorted = undefined
 }
 
+/** Only the known-values layer: for binary payloads, where any other rule could corrupt bytes. */
+export function maskKnownOnly(text: string): { text: string; count: number } {
+  return maskKnown(text)
+}
+
 function maskKnown(text: string): { text: string; count: number } {
   if (known.size === 0 && pinned.size === 0) return { text, count: 0 }
   knownSorted ??= [...new Set([...known, ...pinned])].sort((a, b) => b.length - a.length)
@@ -201,6 +281,13 @@ function maskKnown(text: string): { text: string; count: number } {
   let out = text
   for (const v of knownSorted) {
     if (!out.includes(v)) continue
+    if (pinnedShort.has(v)) {
+      const re = new RegExp(`(?<![A-Za-z0-9])${v.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?![A-Za-z0-9])`, 'g')
+      const before = out
+      out = out.replace(re, () => mask(v, false))
+      if (out !== before) (count++, hit('known'))
+      continue
+    }
     out = out.split(v).join(mask(v, false))
     count++
     hit('known')
@@ -211,7 +298,6 @@ function maskKnown(text: string): { text: string; count: number } {
 // ---------------------------------------------------------------------------
 // Layer 1a: our own known formats (the whole match is masked).
 const WHOLE: RegExp[] = [
-  /-----BEGIN [A-Z0-9 ]*PRIVATE KEY(?: BLOCK)?-----[\s\S]*?-----END [A-Z0-9 ]*PRIVATE KEY(?: BLOCK)?-----/g,
   /\bsk-ant-[A-Za-z0-9_-]{20,}/g, // Anthropic
   /\bsk-(?:proj-|svcacct-|admin-)?[A-Za-z0-9_-]{20,}/g, // OpenAI
   /\b(?:AKIA|ASIA|AGPA|AIDA|AROA)[0-9A-Z]{16}\b/g, // AWS
@@ -240,6 +326,40 @@ const WHOLE: RegExp[] = [
   /\beyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}/g, // JWT
   /\$2[aby]\$\d{2}\$[A-Za-z0-9./]{53}/g, // bcrypt hash
 ]
+
+// PEM private keys, in one pass: each BEGIN is paired with the first END after it, so a text full of
+// BEGIN lines and no END is not scanned to its end once per BEGIN.
+// (gitleaks' own private-key rule is skipped: its lazy body is quadratic on such a text)
+const PK_BEGIN = /-----BEGIN[ A-Z0-9_-]{0,100}PRIVATE KEY(?: BLOCK)?-----/g
+const PK_END = /-----END[ A-Z0-9_-]{0,100}KEY(?: BLOCK)?-----/g
+const PK_MAX = 64 * 1024
+function maskPrivateKeys(text: string): { text: string; count: number } {
+  if (!text.includes('PRIVATE KEY')) return { text, count: 0 }
+  const parts: string[] = []
+  let count = 0
+  let pos = 0
+  let end: RegExpExecArray | null | undefined
+  PK_BEGIN.lastIndex = 0
+  PK_END.lastIndex = 0
+  for (let b = PK_BEGIN.exec(text); b !== null; b = PK_BEGIN.exec(text)) {
+    if (b.index < pos) continue
+    if (end === undefined || (end !== null && end.index < PK_BEGIN.lastIndex)) {
+      PK_END.lastIndex = PK_BEGIN.lastIndex
+      end = PK_END.exec(text)
+    }
+    if (end === null) break // no END after this BEGIN: none after any later one either
+    const stop = end.index + end[0].length
+    if (stop - b.index > PK_MAX) continue
+    parts.push(text.slice(pos, b.index), mask(text.slice(b.index, stop)))
+    count++
+    hit('format')
+    pos = stop
+    PK_BEGIN.lastIndex = stop
+  }
+  if (count === 0) return { text, count: 0 }
+  parts.push(text.slice(pos))
+  return { text: parts.join(''), count }
+}
 
 // ---------------------------------------------------------------------------
 // Layer 1b: gitleaks' ruleset (hooks/gitleaks-rules.ts, generated).
@@ -300,15 +420,25 @@ function gitleaksAllowed(rule: Compiled, secret: string, match: string): boolean
   return false
 }
 
+// gitleaks rules replaced by our own linear versions: theirs scan to the end of the line
+// once per keyword, which is quadratic on a line full of the keyword
+const SKIP_GITLEAKS = new Set(['private-key', 'curl-auth-user', 'curl-auth-header']) // maskPrivateKeys, CURL_FORMS
+
+// Lowercases ASCII letters only, so every index of the result is the same as in `s`
+// (`'İ'.toLowerCase()` is two characters, which would shift the keyword spans).
+const lowerAscii = (s: string) => s.replace(/[A-Z]+/g, m => m.toLowerCase())
+
 function applyGitleaks(text: string, paths: readonly string[]): { text: string; count: number } {
   let count = 0
   let out = text
-  let low = out.toLowerCase()
+  let low = lowerAscii(out)
   for (const rule of compiledGitleaks()) {
+    checkBudget()
+    if (SKIP_GITLEAKS.has(rule.id)) continue
     if (rule.path && !paths.some(p => rule.path!.test(p))) continue // a path-scoped rule needs its file
     if (rule.keywords && !rule.keywords.some(k => low.includes(k))) continue
     let changed = false
-    out = out.replace(rule.re, (...args: unknown[]) => {
+    const apply = (s: string) => s.replace(rule.re, (...args: unknown[]) => {
       const match = args[0] as string
       const hasNamed = typeof args[args.length - 1] === 'object'
       const groups = args.slice(1, hasNamed ? -3 : -2) as (string | undefined)[]
@@ -321,9 +451,53 @@ function applyGitleaks(text: string, paths: readonly string[]): { text: string; 
       hit(`gitleaks:${rule.id}`)
       return match.replace(secret, mask(secret))
     })
-    if (changed) low = out.toLowerCase()
+    const windows = rule.keywords ? keywordWindows(low, rule.keywords) : undefined
+    if (!windows) out = apply(out)
+    else {
+      // only the text around each keyword: a rule's lazy prefix is costly on a long text
+      const parts: string[] = []
+      let pos = 0
+      for (const [a, b] of windows) {
+        checkBudget()
+        parts.push(out.slice(pos, a), apply(out.slice(a, b)))
+        pos = b
+      }
+      parts.push(out.slice(pos))
+      out = parts.join('')
+    }
+    if (changed) low = lowerAscii(out)
   }
   return { text: out, count }
+}
+
+// Spans of `low` around each keyword hit, merged, snapped to line starts; undefined for a
+// short text, or one with so many hits that windows would not help.
+const WIN_BEFORE = 160
+const WIN_AFTER = 512
+const WIN_MAX = 8192 // a span ends at the first space or quote past WIN_AFTER: a secret holds none
+function keywordWindows(low: string, keywords: readonly string[]): [number, number][] | undefined {
+  if (low.length < 8192) return undefined
+  const hits: number[] = []
+  for (const k of keywords) {
+    for (let i = low.indexOf(k); i !== -1; i = low.indexOf(k, i + k.length)) {
+      hits.push(i)
+      if (hits.length > 4096) return undefined
+    }
+  }
+  hits.sort((x, y) => x - y)
+  const out: [number, number][] = []
+  for (const i of hits) {
+    let a = Math.max(0, i - WIN_BEFORE)
+    const nl = low.lastIndexOf('\n', i)
+    if (nl >= a) a = nl + 1
+    let b = Math.min(low.length, i + WIN_AFTER)
+    const stop = low.slice(b, Math.min(low.length, i + WIN_MAX)).search(/[\s"'`]/)
+    b = stop === -1 ? Math.min(low.length, i + WIN_MAX) : b + stop
+    const last = out[out.length - 1]
+    if (last && a <= last[1]) last[1] = Math.max(last[1], b)
+    else out.push([a, b])
+  }
+  return out
 }
 
 // ---------------------------------------------------------------------------
@@ -419,6 +593,49 @@ const KEEP_NAME: RegExp[] = [
   /("auth"\s*:\s*")([A-Za-z0-9+\/]{20,}={0,2})(?=")/g, // docker config.json
 ]
 
+// Secret fields in other notations. Each form is `pre` (with the field's `name`, unless
+// the form names it) then `val`, the masked value; every part is bounded, so each runs
+// in linear time.
+type Form = { re: RegExp; name?: string }
+const FIELD_FORMS: Form[] = [
+  // JSON inside a JSON string: {"body":"{\"password\":\"...\"}"}, AWS SecretString
+  { re: /(?<pre>\\"(?<name>[A-Za-z_][\w.-]{0,63})\\"\s*:\s*\\")(?<val>(?:[^"\\\n]|\\[^"\n]){4,4096}?)(?=\\")/g },
+  // XML: <password>...</password>, and .NET <add key="DbPassword" value="..."/>
+  { re: /(?<pre><(?<name>[A-Za-z_][\w.:-]{0,63})>)(?<val>[^<\n]{4,4096})(?=<\/\k<name>>)/g },
+  { re: /(?<pre>\b(?:key|name)\s*=\s*"(?<name>[^"\n]{1,64})"\s+value\s*=\s*")(?<val>[^"\n]{4,4096})(?=")/g },
+  // command-line flags: --db-password X, --api-key=X
+  { re: /(?<pre>(?<![\w-])--(?<name>[A-Za-z][\w-]{0,63})(?:=|[ \t]+)(?<q>['"]?))(?<val>[^\s'"-][^\s'"]{3,4095})(?=\k<q>(?:\s|$))/g },
+  // mysql -pSECRET
+  { re: /(?<pre>\bmysql(?:dump|admin)?\b[^\n]{0,256}?[ \t]-p)(?<val>[^\s'"-][^\s'"]{3,255})/g, name: 'password' },
+  // SQL: CREATE USER ... IDENTIFIED BY '...', WITH PASSWORD '...'
+  { re: /(?<pre>\b(?:IDENTIFIED[ \t]+BY|WITH[ \t]+(?:ENCRYPTED[ \t]+)?PASSWORD|PASSWORD[ \t]*=)[ \t]*')(?<val>[^'\n]{4,4096})(?=')/gi, name: 'password' },
+  // PHP define('DB_PASSWORD', '...')
+  { re: /(?<pre>\bdefine\(\s*['"](?<name>\w{1,64})['"]\s*,\s*['"])(?<val>[^'"\n]{4,4096})(?=['"])/g },
+]
+// On a line that holds `curl`: -u user:pass, and auth headers
+const CURL_FORMS: Form[] = [
+  { re: /(?<pre>(?<![\w-])(?:-u|--user)(?:=|[ \t]+)(?<q>['"]?)[^\s:'"]{1,256}:)(?<val>[^\s'"]{3,4096})(?=\k<q>(?:\s|$))/g, name: 'password' },
+  { re: /(?<pre>(?<![\w-])(?:-H|--header)(?:=|[ \t]+)(?<q>['"])(?:Authorization:[ \t]*(?:(?:Basic|Bearer|Token)[ \t]+)?|(?:X-[\w-]{0,32})?(?:Api-?)?(?:Key|Token):[ \t]*))(?<val>[^\s'"]{8,4096})(?=\k<q>)/gi, name: 'token' },
+]
+
+function applyForms(text: string, forms: readonly Form[]): { text: string; count: number } {
+  let count = 0
+  let out = text
+  for (const form of forms) {
+    checkBudget()
+    out = out.replace(form.re, (...args: unknown[]) => {
+      const m = args[0] as string
+      const g = args[args.length - 1] as { pre: string; name?: string; val: string }
+      const name = form.name ?? g.name ?? ''
+      if (!isSecretName(name) || g.val.includes(MASK) || isPlaceholderValue(g.val)) return m
+      count++
+      hit('form')
+      return g.pre + mask(g.val, false)
+    })
+  }
+  return { text: out, count }
+}
+
 // ---------------------------------------------------------------------------
 // Layer 3: entropy, for long random-looking tokens with no known format or label.
 const CANDIDATE = /[A-Za-z0-9_\-+=.~]{24,}/g
@@ -480,13 +697,13 @@ const NETRC_PASSWORD = /(\b(?:password|passwd|account)\s+)(\S+)/g
 
 function envLine(line: string): { line: string; hit: boolean } {
   const pg = PGPASS_LINE.exec(line)
-  if (pg && !isPlaceholderValue(pg[2]!) && !pg[2]!.includes(MASK)) {
+  if (pg && !isPlaceholderValue(pg[2]!, true) && !pg[2]!.includes(MASK)) {
     hit('env')
     return { line: pg[1] + mask(pg[2]!), hit: true }
   }
   if (/^\s*(?:machine|default)\b/.test(line) || /^\s*(?:login|password)\s/.test(line)) {
     let n = 0
-    const out = line.replace(NETRC_PASSWORD, (m, head: string, v: string) => (v.includes(MASK) || isPlaceholderValue(v) ? m : (n++, head + mask(v))))
+    const out = line.replace(NETRC_PASSWORD, (m, head: string, v: string) => (v.includes(MASK) || isPlaceholderValue(v, true) ? m : (n++, head + mask(v))))
     if (n > 0) {
       hit('env')
       return { line: out, hit: true }
@@ -496,7 +713,7 @@ function envLine(line: string): { line: string; hit: boolean } {
   if (!m) return { line, hit: false }
   const name = m[1]!.replace(/^\s*(?:export\s+)?["']?|["']?\s*(?:=|:\s)$/g, '')
   const value = m[2]!.trim()
-  if (ENV_SAFE_NAME.test(name) || ENV_SAFE_VALUE.test(value) || value.includes(MASK) || isPlaceholderValue(value)) {
+  if (ENV_SAFE_NAME.test(name) || ENV_SAFE_VALUE.test(value) || value.includes(MASK) || isPlaceholderValue(value, true)) {
     return { line, hit: false }
   }
   hit('env')
@@ -539,7 +756,7 @@ export function seedEnvText(text: string): number {
 
 /** .env-style files: every value in them is treated as a secret. */
 export const ENV_FILE =
-  /(?:^|[\/\s"'=])(?:\.env(?:\.[\w-]+)*|[\w-]+\.env|\.npmrc|\.yarnrc(?:\.yml)?|\.netrc|\.pgpass|\.pypirc|\.git-credentials|credentials(?:\.json)?|secrets?\.(?:json|ya?ml|env)|\.dev\.vars|local\.settings\.json)(?=$|[\s"':;|&)>])/
+  /(?:^|[\/\s"'=])(?:\.env(?:\.[\w-]+)*~?|\.envrc|[\w-]+\.env|\.npmrc|\.yarnrc(?:\.yml)?|\.netrc|\.pgpass|\.pypirc|\.git-credentials|credentials(?:\.json)?|secrets?\.(?:json|ya?ml|env)|\.dev\.vars|local\.settings\.json)(?=$|[\s"':;|&)>])/i
 
 const isTemplateEnvFile = (path: string) => /\.(?:example|sample|template|dist|defaults?)$/i.test(path)
 export const isEnvFile = (path: string) => ENV_FILE.test(path) && !isTemplateEnvFile(path.trim())
@@ -568,10 +785,20 @@ const MAX_LINE = 20000
  * `sources`: the files the output certainly is the content of (a Read's file): values masked
  * in it may be restored into these files, and only these.
  */
-export type Options = { envMode?: boolean; paths?: readonly string[]; sources?: readonly string[] }
+export type Options = {
+  envMode?: boolean
+  paths?: readonly string[]
+  sources?: readonly string[]
+  /** Every line is one bare value (`printenv NAME`): each is masked whole. */
+  bareValues?: boolean
+}
 
 function redactLine(line: string, opts: Options): { line: string; count: number } {
   let count = 0
+  if (opts.bareValues) {
+    const t = line.trim()
+    if (t !== '' && !t.includes(MASK) && !isPlaceholderValue(t, true)) return { line: line.replace(t, mask(t, false)), count: 1 }
+  }
   const g = grepSplit(line)
   if (g) {
     const r = envLine(g.rest)
@@ -583,6 +810,11 @@ function redactLine(line: string, opts: Options): { line: string; count: number 
     const r = envLine(line)
     if (r.hit) count++
     line = r.line
+  }
+  if (line.includes('curl')) {
+    const c = applyForms(line, CURL_FORMS)
+    line = c.text
+    count += c.count
   }
   if (!HASH_CONTEXT.test(line)) line = line.replace(CANDIDATE, tok => (looksRandom(tok) ? (count++, hit('entropy'), mask(tok, false)) : tok))
   return { line, count }
@@ -605,7 +837,14 @@ function redactAll(text: string, opts: Options): { text: string; count: number }
   out = k.text
   count += k.count
 
-  for (const re of WHOLE) out = out.replace(re, (m: string) => (count++, hit('format'), mask(m)))
+  const pk = maskPrivateKeys(out)
+  out = pk.text
+  count += pk.count
+
+  for (const re of WHOLE) {
+    checkBudget()
+    out = out.replace(re, (m: string) => (count++, hit('format'), mask(m)))
+  }
 
   const gl = applyGitleaks(out, opts.paths ?? [])
   out = gl.text
@@ -614,6 +853,10 @@ function redactAll(text: string, opts: Options): { text: string; count: number }
   const a = assignments(out)
   out = a.text
   count += a.count
+
+  const f = applyForms(out, FIELD_FORMS)
+  out = f.text
+  count += f.count
 
   for (const re of KEEP_NAME) {
     out = out.replace(re, (m, name: string, value: string) => {
@@ -625,17 +868,27 @@ function redactAll(text: string, opts: Options): { text: string; count: number }
   }
 
   // per line; a very long line (minified code, a blob) is handled in pieces
+  checkBudget()
   out = out
     .split('\n')
-    .map(line => {
+    .map((line, i) => {
+      if (i % 512 === 0) checkBudget()
       if (line.length <= MAX_LINE) {
         const r = redactLine(line, opts)
         count += r.count
         return r.line
       }
+      if (opts.envMode) {
+        // a long value in a secret file (a certificate, a JSON blob): masked whole
+        const r = envLine(line)
+        if (r.hit) {
+          count++
+          return r.line
+        }
+      }
       let joined = ''
       for (let i = 0; i < line.length; i += MAX_LINE) {
-        const r = redactLine(line.slice(i, i + MAX_LINE), { envMode: false })
+        const r = redactLine(line.slice(i, i + MAX_LINE), { envMode: opts.envMode, bareValues: opts.bareValues })
         count += r.count
         joined += r.line
       }
