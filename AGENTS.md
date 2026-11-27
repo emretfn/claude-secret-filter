@@ -20,8 +20,10 @@ the project's secret files, and shows toasts. Real values stay in module memory.
   a secret back into the world: a change that widens it needs a test showing a
   placeholder cannot reach another file, a new line, a command or a URL.
 - Redaction is bounded in time (`withBudget`): past it the hook throws and its
-  `.catch` withholds the output. A hook that runs past the engine's budget is skipped
-  and the raw result passes, so slow code is a leak, not only a slowdown.
+  `.catch` withholds the output. A hook that runs past the engine's budget loses its
+  worker: the engine starts a fresh one (the vault is gone) and its `.catch` answers.
+  A single regex call cannot be interrupted, so every pattern stays linear: time new
+  ones on 1 MB of hostile text (a line full of the keyword) before merging.
 
 ## Shipped files and versions
 

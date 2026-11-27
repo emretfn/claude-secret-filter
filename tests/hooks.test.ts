@@ -404,3 +404,12 @@ test('an MCP tool reading a secret file by path is in env mode', async ($, on) =
   on('tool.call', { tool: 'mcp__fs__read_file' as never }, () => ({ result: [{ type: 'text', text: `DB_PASS=${weak}` }] }) as never)
   expect(textOf(await $.tool.call({ tool: 'mcp__fs__read_file', path: '/app/.env' } as never)).includes(weak)).toBe(false)
 })
+
+test('a secret in an object key, and in a search_result block, is masked', async ($, on) => {
+  const secret = ghToken()
+  on('tool.call', { tool: 'mcp__x__keys' as never }, () => ({ result: { structuredContent: { [secret]: { ok: true } } } }) as never)
+  expect(textOf(await $.tool.call({ tool: 'mcp__x__keys' } as never)).includes(secret)).toBe(false)
+  const tally = { n: 0 }
+  const out = JSON.stringify(scrubBlocks([{ type: 'search_result', source: 'https://x.example', title: 't', content: [{ type: 'text', text: `key ${secret}` }] }], tally))
+  expect(out.includes(secret)).toBe(false)
+})

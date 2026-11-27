@@ -41,7 +41,7 @@ Nothing else needs to be installed: gitleaks' rules ship converted, as a file.
 
 ![How secret-filter sits between Claude and its tools: tool output goes through the read hook and the redaction engine, so Claude only sees placeholders; real values stay in an in-memory vault, seeded from .env files, and the write hook puts them back when Claude edits a file.](docs/architecture.png)
 
-- **Reading.** Every call to `Bash`, `Read`, `WebFetch`, `WebSearch` or an MCP tool runs as usual. Its output goes through the redaction engine before Claude sees it, failed calls included. Claude reads placeholders where the secrets were.
+- **Reading.** Every call to `Bash`, `Read`, `WebFetch`, `WebSearch` or an MCP tool runs as usual. Its text output goes through the redaction engine before Claude sees it, failed calls included (images and PDFs pass as they are: see [Limits](#limits)). Claude reads placeholders where the secrets were.
 - **Everything else.** Every other row the conversation keeps (other tools such as `Monitor`, background task and subagent results, notifications, attachments) goes through the same engine before the model reads it. Only your own prompt and Claude's own reply are left as written. Some raw output reaches disk before this point: see [Limits](#limits).
 - **The vault.** Each masked value is kept in the mod's memory under its placeholder id, with the files it was read from. Values from the project's git-ignored `.env`-style files are learned at session start.
 - **Writing.** When Claude edits a file and copies a placeholder into `Edit` or `Write`, the write hook swaps the real value back in before the write, **only in the file the value was read from, and only on a line kept exactly as it was**. What the tool returns is masked again.
@@ -53,16 +53,16 @@ The diagram sources are in [`docs/`](docs/) (HTML with inline SVG).
 ![The redaction engine, layer by layer: known values, known formats, secret-named fields, entropy and env mode, in that order.](docs/layers.png)
 
 
-Every string in the output of `Bash`, `Read`, `WebFetch`, `WebSearch` and all MCP
+Every text string in the output of `Bash`, `Read`, `WebFetch`, `WebSearch` and all MCP
 tools goes through these layers, in order:
 
 | Layer | What | Example |
 |---|---|---|
-| Known values | Any value masked once, or found in the project's secret files at session start, is masked wherever it shows up again, also base64 and URL-encoded | a DB password in a stack trace |
+| Known values | A distinctive value (8+ characters, not a plain word) masked by a confident layer, or found in the project's secret files at session start, is masked wherever it shows up again, also base64 and URL-encoded. Entropy guesses and short or letters-only values are not learned, so they are masked only where a layer catches them again | a DB password in a stack trace |
 | Known formats | About 30 rules of our own, plus all 221 rules of [gitleaks](https://github.com/gitleaks/gitleaks) (keyword pre-filter, entropy, allowlists) | `ghp_…`, `sk-ant-…`, Azure DevOps PATs, JWTs, private keys |
-| Secret-named fields | Values of fields whose name ends in `password`, `secret`, `token`, `apiKey`, … Code is told apart from data: `token: CancellationToken` and `x = compute()` stay | `"clientSecret": "…"`, `Password=…;`, `user:pass@host` |
+| Secret-named fields | Values of fields whose name ends in `password`, `secret`, `token`, `apiKey`, … Also in escaped JSON, XML elements and `key="…" value="…"` attributes, `--flags`, `curl -u`/`-H`, `mysql -p`, SQL `IDENTIFIED BY`/`WITH PASSWORD` and PHP `define()`. Code is told apart from data: `token: CancellationToken` and `x = compute()` stay | `"clientSecret": "…"`, `Password=…;`, `user:pass@host` |
 | Entropy | Long, random-looking tokens of no known format and with no label | an unlabeled 40-char token |
-| Env mode | For `.env*`, `.npmrc`, `.netrc`, `.pgpass`, `credentials`, `secrets.json`, … and for `env`/`printenv`, every value except booleans, numbers and a few safe names (`PATH`, `NODE_ENV`, `PORT`, …) | `DATABASE_HOST=` followed by a placeholder |
+| Env mode | For `.env`, `.env.local` and other `.env.*` (not the templates `.example`, `.sample`, `.template`, `.dist`, `.defaults`), `.envrc`, `.npmrc`, `.netrc`, `.pgpass`, `credentials`, `secrets.json`, … and for `env`/`printenv` (also under `sudo` or `docker exec`), every value except booleans, numbers and a few safe names (`PATH`, `NODE_ENV`, `PORT`, …) | `DATABASE_HOST=` followed by a placeholder |
 
 Failed commands (non-zero exit) are masked too, and so are `grep` lines that come
 from env files.
@@ -75,7 +75,9 @@ from env files.
   somewhere public cannot be checked against guessed passwords.
 - For `Edit` and `Write`, placeholders in the input are turned back into the real
   values just before the write. The tool's result is masked again,
-  and a restored value stays masked in every later output, whatever it looks like.
+  and a restored value of 3 characters or more stays masked in later outputs
+  whatever it looks like (one under 8 characters only as a whole word), until the
+  mod reloads.
 - **A value is only restored into the file it was read from with `Read`, and only
   on a line kept exactly as it was**: the mod compares the whole file before and
   after the write, and every line that holds a restored value must be a line of the
@@ -128,8 +130,17 @@ This is defense in depth, not a guarantee. It does not:
 - catch every short random token: the entropy layer misses about 20% of 24-char
   tokens and 1–5% of 32+ char tokens. Known formats are always caught.
 - catch secrets that are split, reversed or hex-encoded.
+- look inside images and PDFs: a screenshot or a scanned document that shows a
+  token reaches Claude as it is.
+- filter text piped into a non-interactive prompt (`cat .env | claude -p`, the SDK):
+  that is your own prompt.
+- forget less than it learned: the vault lives in memory, so a reload of the mod (or
+  of the engine's hook worker) empties it. Placeholders from before are refused on
+  write, and values learned while working are masked again only when a layer
+  catches them again.
 
-Seeding reads up to 50 secret files, 4 directory levels deep from the session's
+Seeding runs in the background at session start (the first tool calls may come
+before it ends) and reads up to 50 secret files, 4 directory levels deep from the session's
 directory, nearest first. In a git repository it reads only files git ignores: a
 secret file committed to a cloned repository is not yours, and could plant "decoys"
 that hide ordinary code. Plain words, code identifiers, plain URLs and values that

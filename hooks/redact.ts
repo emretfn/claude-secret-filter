@@ -420,6 +420,10 @@ function gitleaksAllowed(rule: Compiled, secret: string, match: string): boolean
   return false
 }
 
+// gitleaks rules replaced by our own linear versions: theirs scan to the end of the line
+// once per keyword, which is quadratic on a line full of the keyword
+const SKIP_GITLEAKS = new Set(['private-key', 'curl-auth-user', 'curl-auth-header']) // maskPrivateKeys, CURL_FORMS
+
 // Lowercases ASCII letters only, so every index of the result is the same as in `s`
 // (`'İ'.toLowerCase()` is two characters, which would shift the keyword spans).
 const lowerAscii = (s: string) => s.replace(/[A-Z]+/g, m => m.toLowerCase())
@@ -430,7 +434,7 @@ function applyGitleaks(text: string, paths: readonly string[]): { text: string; 
   let low = lowerAscii(out)
   for (const rule of compiledGitleaks()) {
     checkBudget()
-    if (rule.id === 'private-key') continue // maskPrivateKeys
+    if (SKIP_GITLEAKS.has(rule.id)) continue
     if (rule.path && !paths.some(p => rule.path!.test(p))) continue // a path-scoped rule needs its file
     if (rule.keywords && !rule.keywords.some(k => low.includes(k))) continue
     let changed = false
@@ -589,6 +593,49 @@ const KEEP_NAME: RegExp[] = [
   /("auth"\s*:\s*")([A-Za-z0-9+\/]{20,}={0,2})(?=")/g, // docker config.json
 ]
 
+// Secret fields in other notations. Each form is `pre` (with the field's `name`, unless
+// the form names it) then `val`, the masked value; every part is bounded, so each runs
+// in linear time.
+type Form = { re: RegExp; name?: string }
+const FIELD_FORMS: Form[] = [
+  // JSON inside a JSON string: {"body":"{\"password\":\"...\"}"}, AWS SecretString
+  { re: /(?<pre>\\"(?<name>[A-Za-z_][\w.-]{0,63})\\"\s*:\s*\\")(?<val>(?:[^"\\\n]|\\[^"\n]){4,4096}?)(?=\\")/g },
+  // XML: <password>...</password>, and .NET <add key="DbPassword" value="..."/>
+  { re: /(?<pre><(?<name>[A-Za-z_][\w.:-]{0,63})>)(?<val>[^<\n]{4,4096})(?=<\/\k<name>>)/g },
+  { re: /(?<pre>\b(?:key|name)\s*=\s*"(?<name>[^"\n]{1,64})"\s+value\s*=\s*")(?<val>[^"\n]{4,4096})(?=")/g },
+  // command-line flags: --db-password X, --api-key=X
+  { re: /(?<pre>(?<![\w-])--(?<name>[A-Za-z][\w-]{0,63})(?:=|[ \t]+)(?<q>['"]?))(?<val>[^\s'"-][^\s'"]{3,4095})(?=\k<q>(?:\s|$))/g },
+  // mysql -pSECRET
+  { re: /(?<pre>\bmysql(?:dump|admin)?\b[^\n]{0,256}?[ \t]-p)(?<val>[^\s'"-][^\s'"]{3,255})/g, name: 'password' },
+  // SQL: CREATE USER ... IDENTIFIED BY '...', WITH PASSWORD '...'
+  { re: /(?<pre>\b(?:IDENTIFIED[ \t]+BY|WITH[ \t]+(?:ENCRYPTED[ \t]+)?PASSWORD|PASSWORD[ \t]*=)[ \t]*')(?<val>[^'\n]{4,4096})(?=')/gi, name: 'password' },
+  // PHP define('DB_PASSWORD', '...')
+  { re: /(?<pre>\bdefine\(\s*['"](?<name>\w{1,64})['"]\s*,\s*['"])(?<val>[^'"\n]{4,4096})(?=['"])/g },
+]
+// On a line that holds `curl`: -u user:pass, and auth headers
+const CURL_FORMS: Form[] = [
+  { re: /(?<pre>(?<![\w-])(?:-u|--user)(?:=|[ \t]+)(?<q>['"]?)[^\s:'"]{1,256}:)(?<val>[^\s'"]{3,4096})(?=\k<q>(?:\s|$))/g, name: 'password' },
+  { re: /(?<pre>(?<![\w-])(?:-H|--header)(?:=|[ \t]+)(?<q>['"])(?:Authorization:[ \t]*(?:(?:Basic|Bearer|Token)[ \t]+)?|(?:X-[\w-]{0,32})?(?:Api-?)?(?:Key|Token):[ \t]*))(?<val>[^\s'"]{8,4096})(?=\k<q>)/gi, name: 'token' },
+]
+
+function applyForms(text: string, forms: readonly Form[]): { text: string; count: number } {
+  let count = 0
+  let out = text
+  for (const form of forms) {
+    checkBudget()
+    out = out.replace(form.re, (...args: unknown[]) => {
+      const m = args[0] as string
+      const g = args[args.length - 1] as { pre: string; name?: string; val: string }
+      const name = form.name ?? g.name ?? ''
+      if (!isSecretName(name) || g.val.includes(MASK) || isPlaceholderValue(g.val)) return m
+      count++
+      hit('form')
+      return g.pre + mask(g.val, false)
+    })
+  }
+  return { text: out, count }
+}
+
 // ---------------------------------------------------------------------------
 // Layer 3: entropy, for long random-looking tokens with no known format or label.
 const CANDIDATE = /[A-Za-z0-9_\-+=.~]{24,}/g
@@ -709,7 +756,7 @@ export function seedEnvText(text: string): number {
 
 /** .env-style files: every value in them is treated as a secret. */
 export const ENV_FILE =
-  /(?:^|[\/\s"'=])(?:\.env(?:\.[\w-]+)*|[\w-]+\.env|\.npmrc|\.yarnrc(?:\.yml)?|\.netrc|\.pgpass|\.pypirc|\.git-credentials|credentials(?:\.json)?|secrets?\.(?:json|ya?ml|env)|\.dev\.vars|local\.settings\.json)(?=$|[\s"':;|&)>])/i
+  /(?:^|[\/\s"'=])(?:\.env(?:\.[\w-]+)*~?|\.envrc|[\w-]+\.env|\.npmrc|\.yarnrc(?:\.yml)?|\.netrc|\.pgpass|\.pypirc|\.git-credentials|credentials(?:\.json)?|secrets?\.(?:json|ya?ml|env)|\.dev\.vars|local\.settings\.json)(?=$|[\s"':;|&)>])/i
 
 const isTemplateEnvFile = (path: string) => /\.(?:example|sample|template|dist|defaults?)$/i.test(path)
 export const isEnvFile = (path: string) => ENV_FILE.test(path) && !isTemplateEnvFile(path.trim())
@@ -764,6 +811,11 @@ function redactLine(line: string, opts: Options): { line: string; count: number 
     if (r.hit) count++
     line = r.line
   }
+  if (line.includes('curl')) {
+    const c = applyForms(line, CURL_FORMS)
+    line = c.text
+    count += c.count
+  }
   if (!HASH_CONTEXT.test(line)) line = line.replace(CANDIDATE, tok => (looksRandom(tok) ? (count++, hit('entropy'), mask(tok, false)) : tok))
   return { line, count }
 }
@@ -802,6 +854,10 @@ function redactAll(text: string, opts: Options): { text: string; count: number }
   out = a.text
   count += a.count
 
+  const f = applyForms(out, FIELD_FORMS)
+  out = f.text
+  count += f.count
+
   for (const re of KEEP_NAME) {
     out = out.replace(re, (m, name: string, value: string) => {
       if (value.startsWith(MASK) || isPlaceholderValue(value)) return m
@@ -822,9 +878,17 @@ function redactAll(text: string, opts: Options): { text: string; count: number }
         count += r.count
         return r.line
       }
+      if (opts.envMode) {
+        // a long value in a secret file (a certificate, a JSON blob): masked whole
+        const r = envLine(line)
+        if (r.hit) {
+          count++
+          return r.line
+        }
+      }
       let joined = ''
       for (let i = 0; i < line.length; i += MAX_LINE) {
-        const r = redactLine(line.slice(i, i + MAX_LINE), { envMode: false })
+        const r = redactLine(line.slice(i, i + MAX_LINE), { envMode: opts.envMode, bareValues: opts.bareValues })
         count += r.count
         joined += r.line
       }

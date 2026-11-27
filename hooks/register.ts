@@ -117,7 +117,14 @@ function walk(v: unknown, opts: Options, tally: { n: number }): unknown {
   if (v && typeof v === 'object') {
     const src = v as Record<string, unknown>
     const o: Record<string, unknown> = {}
-    for (const [k, x] of Object.entries(src)) {
+    for (const [key, x] of Object.entries(src)) {
+      // a key can hold a secret too ({"<token>": ...}): masked like a value
+      let k = key
+      if (/\d/.test(key) || key.length > 64) {
+        const rk = redact(key, opts)
+        tally.n += rk.count
+        k = rk.text
+      }
       // base64 may be wrapped in lines, never spaced: a text with spaces is filtered as text
       if (BINARY_KEYS.has(k) && typeof x === 'string' && x.length > 256 && BASE64.test(x.replace(/\r?\n/g, ''))) {
         o[k] = walkBase64(x.replace(/\r?\n/g, ''), opts, tally)
@@ -293,6 +300,11 @@ export function scrubBlocks(blocks: readonly Block[], tally: { n: number }): Blo
       const before = tally.n
       const doc = walk(b, rowOptions(JSON.stringify(b).slice(0, 4096)), tally) as Block
       return tally.n > before ? doc : b
+    }
+    if (b.type === 'search_result') {
+      const before = tally.n
+      const sr = walk(b, rowOptions(''), tally) as Block
+      return tally.n > before ? sr : b
     }
     if (b.type === 'tool_result') {
       if (typeof b.content === 'string') {
@@ -514,7 +526,9 @@ export const register: Register = on => {
     // the filter failed on this row: its text is withheld rather than kept unfiltered
     if (next.called) return undefined as never
     const withheld = { type: 'text', text: 'secret-filter failed on this row; its text is withheld.' }
-    const content = (e.message.content as Block[]).map(b => (b.type === 'text' ? withheld : b.type === 'tool_result' ? { ...b, content: withheld.text } : b))
+    const content = (e.message.content as Block[]).map(b =>
+      b.type === 'text' || b.type === 'search_result' ? withheld : b.type === 'tool_result' ? { ...b, content: withheld.text } : b,
+    )
     return next({ ...e, message: { ...e.message, content } })
   })
 }
