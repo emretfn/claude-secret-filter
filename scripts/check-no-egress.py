@@ -48,6 +48,7 @@ PLUGIN_KEYS = {"name", "version", "description", "license", "keywords", "author"
 MARKETPLACE = {"name", "owner", "plugins", "description"}
 
 FORBIDDEN = {
+    r"\bconsole\b": "console (its output may land in a log file)",
     r"\bfetch\b": "network: fetch",
     r"\bXMLHttpRequest\b": "network: XMLHttpRequest",
     r"\bWebSocket\b": "network: WebSocket",
@@ -67,7 +68,10 @@ FORBIDDEN = {
     r"\bsetTimeout\s*\(\s*['\"`]": "setTimeout with a string",
     r"(?<![\\\w])\$\s*\[": "$ accessed by index",  # not an escaped \$ inside a regex
 }
-IMPORT = re.compile(r"""^\s*import\b[^'"]*['"]([^'"]+)['"]""", re.M)
+# every module specifier: `import ... from`, a bare `import '...'`, and `export ... from`
+IMPORT = re.compile(r"""(?:\bfrom\s*|^\s*import\s*)['"]([^'"]+)['"]""", re.M)
+# a \u escape that spells an identifier character could hide a name (fetch) from the patterns
+UNICODE_ESCAPE = re.compile(r"\\u(?:\{([0-9a-fA-F]+)\}|([0-9a-fA-F]{4}))")
 ALLOWED_IMPORTS = {"claude-code", "./redact", "./gitleaks-rules"}
 DOLLAR_CALL = re.compile(r"\$\.([A-Za-z_]\w*)\.([A-Za-z_]\w*)")
 
@@ -95,6 +99,10 @@ def static_check() -> list[str]:
             for m in re.finditer(pattern, src):
                 line = src.count("\n", 0, m.start()) + 1
                 errors.append(f"hooks/{p.name}:{line}: forbidden ({what})")
+        for m in UNICODE_ESCAPE.finditer(src):
+            if re.fullmatch(r"[A-Za-z0-9_$]", chr(int(m.group(1) or m.group(2), 16))):
+                line = src.count("\n", 0, m.start()) + 1
+                errors.append(f"hooks/{p.name}:{line}: forbidden (a \\u escape of an identifier character)")
         for spec in IMPORT.findall(src):
             if spec not in ALLOWED_IMPORTS:
                 errors.append(f"hooks/{p.name}: forbidden import {spec!r}")

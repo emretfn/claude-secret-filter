@@ -18,15 +18,16 @@ jobs:
         with:
           persist-credentials: false
           fetch-depth: 0
-      # On a pull request the guard scripts come from the base branch, so a pull request
-      # cannot loosen the checks it is judged by. A change to a guard script lands in a
-      # pull request of its own first.
+      # On a pull request the guard scripts come from the base branch, so editing them
+      # does not loosen the checks the pull request is judged by (this file itself runs
+      # as the pull request has it: a change here is reviewed by hand). A change to a
+      # guard script lands in a pull request of its own first.
       - name: Guard scripts from the base branch
         env:
           BASE: ${{ github.event_name == 'pull_request' && github.base_ref || '' }}
         run: |
           mkdir -p "$RUNNER_TEMP/guard"
-          for f in check-no-egress.py check-version-bump.py; do
+          for f in check-no-egress.py check-version-bump.py gen-gitleaks-rules.py; do
             if [ -n "$BASE" ] && git show "origin/$BASE:scripts/$f" > "$RUNNER_TEMP/guard/$f" 2>/dev/null && grep -q -- '--root' "$RUNNER_TEMP/guard/$f"; then
               echo "using origin/$BASE:scripts/$f"
             else
@@ -42,7 +43,7 @@ jobs:
         run: python3 "$RUNNER_TEMP/guard/check-version-bump.py" --root "$GITHUB_WORKSPACE" "origin/$BASE"
       - name: gitleaks rules are generated, not hand-edited
         run: |
-          python3 scripts/gen-gitleaks-rules.py
+          python3 "$RUNNER_TEMP/guard/gen-gitleaks-rules.py" --root "$GITHUB_WORKSPACE"
           git diff --exit-code -- hooks/gitleaks-rules.ts
 
   test:

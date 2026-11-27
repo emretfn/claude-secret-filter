@@ -73,10 +73,12 @@ it: regex literals and test fixtures show up as placeholders. Edit through them,
 
 ## Guard scripts
 
-On a pull request, CI runs `scripts/check-no-egress.py` and
-`scripts/check-version-bump.py` from the base branch, so a pull request cannot loosen
-the checks it is judged by. Change a guard script (or its allowlists) in a pull
-request of its own, merged before the change that needs it.
+On a pull request, CI runs `scripts/check-no-egress.py`, `scripts/check-version-bump.py`
+and `scripts/gen-gitleaks-rules.py` from the base branch, so editing them does not
+loosen the checks a pull request is judged by. The workflow file itself runs as the
+pull request has it, so a change under `.github/` is reviewed by hand. Change a
+guard script (or its allowlists) in a pull request of its own, merged before the
+change that needs it.
 
 ## Pull requests
 
