@@ -327,7 +327,7 @@ const WHOLE: RegExp[] = [
   /\$2[aby]\$\d{2}\$[A-Za-z0-9./]{53}/g, // bcrypt hash
 ]
 
-// PEM private keys, in one pass: each BEGIN is paired with the next END, so a text full of
+// PEM private keys, in one pass: each BEGIN is paired with the first END after it, so a text full of
 // BEGIN lines and no END is not scanned to its end once per BEGIN.
 // (gitleaks' own private-key rule is skipped: its lazy body is quadratic on such a text)
 const PK_BEGIN = /-----BEGIN[ A-Z0-9_-]{0,100}PRIVATE KEY(?: BLOCK)?-----/g

@@ -242,7 +242,7 @@ export async function findSecretFiles(list: List, read: ReadText, root: string):
   let queue: { dir: string; depth: number; repo?: Repo }[] = [{ dir: root, depth: 0 }]
   let dirs = 0
   while (queue.length > 0 && out.length < MAX_FILES && dirs < MAX_DIRS) {
-    const next: typeof queue = []
+    const level: typeof queue = []
     for (const item of queue) {
       if (++dirs > MAX_DIRS) break
       const { dir, depth } = item
@@ -256,14 +256,14 @@ export async function findSecretFiles(list: List, read: ReadText, root: string):
       }
       for (const en of entries) {
         const path = `${dir}/${en.name}`
-        if (en.kind === 'dir' && !SKIP_DIRS.has(en.name) && depth < MAX_DEPTH) next.push({ dir: path, depth: depth + 1, repo })
+        if (en.kind === 'dir' && !SKIP_DIRS.has(en.name) && depth < MAX_DEPTH) level.push({ dir: path, depth: depth + 1, repo })
         else if (en.kind === 'file' && en.size <= MAX_BYTES && isEnvFile(path) && out.length < MAX_FILES) {
           const rel = repo ? path.slice(repo.root.length + 1) : ''
           if (!repo || (isIgnored(repo.rules, path) && !isTracked(repo.index, rel))) out.push(path)
         }
       }
     }
-    queue = next
+    queue = level
   }
   return out
 }
