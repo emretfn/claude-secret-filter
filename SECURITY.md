@@ -7,12 +7,19 @@ secret-filter sees every secret it masks, so the code it runs is guarded:
   no bypass, the maintainer included.
 - Release tags (`v*`) cannot be moved or deleted, so a published version cannot be
   swapped for different code.
-- CI fails when the mod's code could send data anywhere. The main gate is the
-  engine's own report of what the module calls (`claude plugin validate --json`),
-  which resolves every `$` call and refuses `$` used as a value: only `$.fs.list`,
-  `$.fs.read` and `$.ui.toast` are allowed. A static check
-  (`scripts/check-no-egress.py`) adds a second layer: network APIs, dynamic imports,
-  `eval`, `Function` and runtime globals are refused.
+- CI fails on the ways the mod's code could reach out that a check can see. The
+  main gate is the engine's own report of the module (`claude plugin validate
+  --json`), which resolves every `$` call and refuses `$` used as a value: only
+  `$.fs.list`, `$.fs.read` and `$.ui.toast` are allowed, and the events the module
+  hooks are pinned. A static check (`scripts/check-no-egress.py`) adds a second
+  layer: network APIs, dynamic imports, `eval`, `Function` and runtime globals are
+  refused, and every input the module passes on rewritten (`next({ ... })`) must be
+  one of the reviewed rewrites.
+- What no check can prove is what an allowed hook does with a tool call's input: a
+  hook could still put a value into a `WebFetch` URL or a command it passes on
+  without a new rewrite site, for instance by changing what `restore` returns. The
+  guard is that every change is a reviewed pull request; read `hooks/register.ts`
+  in the diff before you update.
 - The marketplace installs the whole repository, so CI pins its layout: a new
   top-level file or folder, or a manifest key that could declare hooks, servers or
   commands, fails until it is added to the allowlist in review.
