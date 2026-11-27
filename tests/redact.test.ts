@@ -270,3 +270,19 @@ test('a secret kept in place in a gitleaks keyword window is still masked', () =
   const text = 'x '.repeat(10000) + `github token ${tok} ` + 'y '.repeat(10000)
   expect(redact(text).text.includes(tok)).toBe(false)
 })
+
+test('non-ASCII text before a secret does not shift the keyword spans', () => {
+  const tok = 'gh' + 'p_' + rnd(36)
+  const text = 'İ'.repeat(700) + ' ' + 'x '.repeat(5000) + `github token ${tok} ` + 'y '.repeat(5000)
+  expect(redact(text).text.includes(tok)).toBe(false)
+})
+
+test('PEM keys: masked whole, and a text of BEGIN lines with no END is quick', () => {
+  const body = Array.from({ length: 10 }, () => rnd(64)).join('\n')
+  const pem = `-----BEGIN RSA PRIVATE KEY-----\n${body}\n-----END RSA PRIVATE KEY-----`
+  expect(redact(`key:\n${pem}\nafter`).text).toMatch(/^key:\n\[REDACTED:[0-9a-f]{8}\]\nafter$/)
+  const hostile = '-----BEGIN RSA PRIVATE KEY-----\n'.repeat(30000)
+  const t0 = Date.now()
+  redact(hostile)
+  expect(Date.now() - t0 < 2000).toBe(true)
+})

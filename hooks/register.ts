@@ -21,12 +21,15 @@ const handledHere = (tool: string) =>
   tool.startsWith('mcp__') || (TOOLS as readonly unknown[]).includes(tool) || (WRITERS as readonly unknown[]).includes(tool)
 
 // Commands whose whole output is environment content
+// (`env` also after `sudo`, a path, or `docker exec <c>`; `printenv NAME` prints one value)
 const ENV_COMMAND =
-  /(?:^|[|;&(]\s*|\$\(\s*)(?:env|printenv|export\s+-p|declare\s+-p?x|set)\s*(?:$|[|;&)>])|\b(?:vercel|eas|netlify|railway|fly|heroku)\s+(?:env|secrets?|config)\b/
+  /(?:^|[\s|;&(/]|\$\()(?:env(?:\s+-[-\w]+)*|export(?:\s+-p)?|declare\s+-p?x|set|compgen\s+-[ev])\s*(?:$|[|;&)>])|\bprintenv\b|\/proc\/[\w$]+\/environ\b|\b(?:vercel|eas|netlify|railway|fly|heroku)\s+(?:env|secrets?|config)\b/
 
 type Loose = { tool: string; [k: string]: unknown }
 const str = (e: Loose, k: string) => (typeof e[k] === 'string' ? (e[k] as string) : '')
 const target = (e: Loose) => str(e, 'file_path') || str(e, 'notebook_path')
+// Paths an MCP tool or a resource read names (`path`, `uri`): a secret file there turns env mode on
+const mcpPaths = (e: Loose) => ['path', 'file_path', 'uri'].map(k => str(e, k).replace(/^file:\/\//, '')).filter(Boolean)
 
 // The files an output may have come from: path-scoped gitleaks rules run only on their own files.
 function paths(e: Loose): string[] {
@@ -37,7 +40,8 @@ function paths(e: Loose): string[] {
       .filter(t => /[\w-]\.[\w]+$|\/[\w.-]+$/.test(t) || isEnvFile(t))
   }
   const p = target(e)
-  return p ? [p] : []
+  if (p) return [p]
+  return e.tool === 'ReadMcpResourceTool' || e.tool.startsWith('mcp__') ? mcpPaths(e) : []
 }
 
 // The file an output is the content of, for sure: a value masked in it may be restored there.
@@ -57,25 +61,18 @@ function envMode(e: Loose): boolean {
     case 'Bash':
       return paths(e).some(isEnvFile) || ENV_COMMAND.test(str(e, 'command'))
     default:
-      return false
+      return paths(e).some(isEnvFile)
   }
 }
 
-const options = (e: Loose): Options => ({ envMode: envMode(e), paths: paths(e), sources: sources(e) })
-
-// The source of the cell a NotebookEdit replaces ('' for a new cell, or if not found)
-function notebookCell(json: string, e: Loose): string {
-  if (str(e, 'edit_mode') === 'insert') return ''
-  try {
-    const nb = JSON.parse(json) as { cells?: { id?: string; source?: string | string[] }[] }
-    const id = str(e, 'cell_id')
-    const cell = nb.cells?.find(c => c.id === id) ?? (/^\d+$/.test(id) ? nb.cells?.[Number(id)] : undefined)
-    const src = cell?.source
-    return Array.isArray(src) ? src.join('') : (src ?? '')
-  } catch {
-    return ''
-  }
-}
+// `printenv NAME`: the output is the bare values, with no names to go by
+const PRINTENV_NAMES = /^\s*(?:sudo\s+)?(?:\S*\/)?printenv(?:\s+\w+)+\s*$/
+const options = (e: Loose): Options => ({
+  envMode: envMode(e),
+  paths: paths(e),
+  sources: sources(e),
+  bareValues: e.tool === 'Bash' && PRINTENV_NAMES.test(str(e, 'command')),
+})
 
 // Binary payloads (the base64 of an image or PDF the Read tool returns, an MCP image
 // block's data) are not run through the text rules: masking random base64 would corrupt
@@ -121,8 +118,9 @@ function walk(v: unknown, opts: Options, tally: { n: number }): unknown {
     const src = v as Record<string, unknown>
     const o: Record<string, unknown> = {}
     for (const [k, x] of Object.entries(src)) {
-      if (BINARY_KEYS.has(k) && typeof x === 'string' && x.length > 256 && BASE64.test(x.replace(/\s+/g, ''))) {
-        o[k] = walkBase64(x.replace(/\s+/g, ''), opts, tally)
+      // base64 may be wrapped in lines, never spaced: a text with spaces is filtered as text
+      if (BINARY_KEYS.has(k) && typeof x === 'string' && x.length > 256 && BASE64.test(x.replace(/\r?\n/g, ''))) {
+        o[k] = walkBase64(x.replace(/\r?\n/g, ''), opts, tally)
       } else {
         o[k] = walk(x, opts, tally)
       }
@@ -283,12 +281,18 @@ type Block = { type: string; [k: string]: unknown }
 const FILE_PATH = /"?(?:file_path|filePath|path)"?\s*[:=]\s*"([^"\n]+)"/g
 const rowOptions = (text: string): Options => ({ envMode: [...text.matchAll(FILE_PATH)].some(m => isEnvFile(m[1]!)) })
 
-function scrubBlocks(blocks: readonly Block[], tally: { n: number }): Block[] {
+export function scrubBlocks(blocks: readonly Block[], tally: { n: number }): Block[] {
   return blocks.map(b => {
     if (b.type === 'text' && typeof b.text === 'string') {
       const r = redact(b.text, rowOptions(b.text))
       tally.n += r.count
       return r.count ? { ...b, text: r.text } : b
+    }
+    if (b.type === 'document') {
+      // a document's text (its `source.data`, or base64 of it) and its title
+      const before = tally.n
+      const doc = walk(b, rowOptions(JSON.stringify(b).slice(0, 4096)), tally) as Block
+      return tally.n > before ? doc : b
     }
     if (b.type === 'tool_result') {
       if (typeof b.content === 'string') {
@@ -398,28 +402,40 @@ export const register: Register = on => {
       }
     }
 
-    // ... and only where it already was in that file: never into a new line
+    // ... and only where it already was in that file: on its own line, unchanged
     const values = [...new Set(WRITE_FIELDS.flatMap(k => (typeof loose[k] === 'string' ? restore(loose[k] as string, file).values : [])))]
     if (values.length > 0) {
-      let newText: string
-      let source: string
-      if (loose.tool === 'Edit') {
-        newText = rewritten.new_string ?? ''
-        source = rewritten.old_string ?? '' // the tool checks old_string is in the file
-      } else if (loose.tool === 'Write') {
-        newText = rewritten.content ?? ''
-        source = await $.fs.read(file).catch(() => '')
-      } else {
-        newText = rewritten.new_source ?? ''
-        source = notebookCell(await $.fs.read(file).catch(() => ''), loose)
+      if (loose.tool === 'NotebookEdit') {
+        return {
+          deny:
+            `secret-filter: placeholders are not restored in notebooks. Leave the cell that holds a masked value as it is, ` +
+            `or ask the user to make this change.`,
+        }
       }
-      const moved = movedValues(newText, source, values)
+      const before = await $.fs.read(file).catch(() => '')
+      let after: string
+      if (loose.tool === 'Edit') {
+        const old = rewritten.old_string ?? ''
+        if (old === '' || !before.includes(old)) {
+          return {
+            deny:
+              `secret-filter: the text to replace was not found as it is in ${file}, so the placement of its masked values ` +
+              `cannot be checked. Read the file again and copy the lines exactly.`,
+          }
+        }
+        const neu = rewritten.new_string ?? ''
+        after = loose.replace_all === true ? before.split(old).join(neu) : before.replace(old, () => neu)
+      } else {
+        after = rewritten.content ?? ''
+      }
+      const moved = movedValues(after, before, values)
       if (moved.length > 0) {
         return {
           deny:
-            `secret-filter: ${moved.length} masked value(s) would be written to a new place in ${file}. A placeholder is only restored where ` +
-            `its value already is (the same line, or a part of it), so it cannot be moved into a new line, command or URL. ` +
-            `Keep the line that holds it as it is, or ask the user to make this change.`,
+            `secret-filter: ${moved.length} masked value(s) would be written to a new or changed line in ${file}. A placeholder is ` +
+            `only restored on a line kept exactly as it is in the file, so a value cannot be moved, copied or edited into a new ` +
+            `line, command or URL. Keep each line that holds a placeholder unchanged (edit the lines around it), or ask the user ` +
+            `to make this change.`,
         }
       }
     }
@@ -459,6 +475,16 @@ export const register: Register = on => {
     const ran = await next(e)
     if (ran.deny !== undefined) return ran
     const opts = options(e as unknown as Loose)
+    if (ran.isError === true) {
+      // an error keeps its shape: its text, and what the transcript stores, masked
+      const tally = { n: 0 }
+      const text = withBudget(BUDGET_MS, () => masked(ran.text ?? '', opts))
+      const result = withBudget(BUDGET_MS, () => walk(ran.result, opts, tally))
+      if (text.count === 0 && tally.n === 0) return ran
+      $.ui.toast(`secret-filter: masked ${Math.max(text.count, tally.n)} value(s) in ${e.tool} error output`)
+      const { ref: _ref, ...rest } = ran
+      return { ...rest, text: text.text, result }
+    }
     const tally = { n: 0 }
     const result = withBudget(BUDGET_MS, () => walk(ran.result, opts, tally))
     if (tally.n === 0) return ran

@@ -149,29 +149,38 @@ export function restore(text: string, target: string): { text: string; missing: 
 }
 
 /**
- * A restored value may only land where it already was: each place it appears in the new
- * text, the text around it on its line must be part of a line of `source` (the replaced
- * text, or the file as it is), no more often than there. So a value can be kept, or its
- * line trimmed, but never moved into a new line such as `curl https://...?t=<value>`.
+ * A restored value may only stay where it already was: every line of `after` that holds
+ * it (every block of lines, for a value spanning lines) must be a whole line of `before`,
+ * unchanged, no more often than there. `before` and `after` are the whole file before and
+ * after the write. So a line holding a secret can be kept or deleted, but not edited,
+ * split or copied: the value never lands in a new line such as `curl ...?t=<value>`.
  * Returns the values that would land somewhere new.
  */
-export function movedValues(text: string, source: string, values: readonly string[]): string[] {
+export function movedValues(after: string, before: string, values: readonly string[]): string[] {
   const moved: string[] = []
+  const lineStart = (t: string, i: number) => t.lastIndexOf('\n', i - 1) + 1
+  const lineEnd = (t: string, i: number) => (t.indexOf('\n', i) === -1 ? t.length : t.indexOf('\n', i))
+  // how often `span` is in `t` as whole lines
+  const wholeLines = (t: string, span: string) => {
+    let n = 0
+    for (let i = t.indexOf(span); i !== -1; i = t.indexOf(span, i + 1)) {
+      if ((i === 0 || t[i - 1] === '\n') && (i + span.length === t.length || t[i + span.length] === '\n')) n++
+    }
+    return n
+  }
   for (const v of values) {
+    if (v === '') continue
     const need = new Map<string, number>()
-    for (let i = text.indexOf(v); i !== -1; i = text.indexOf(v, i + v.length)) {
-      const start = text.lastIndexOf('\n', i - 1) + 1
-      const endNl = text.indexOf('\n', i + v.length)
-      const span = text.slice(start, endNl === -1 ? text.length : endNl)
+    let lastStart = -1
+    for (let i = after.indexOf(v); i !== -1; i = after.indexOf(v, i + 1)) {
+      const start = lineStart(after, i)
+      if (start === lastStart) continue // the same line, counted once
+      lastStart = start
+      const span = after.slice(start, lineEnd(after, i + v.length))
       need.set(span, (need.get(span) ?? 0) + 1)
     }
-    const sourceLines = source.split('\n')
-    const isMultiLine = v.includes('\n')
     for (const [span, n] of need) {
-      const have = isMultiLine
-        ? source.split(span).length - 1
-        : sourceLines.reduce((k, line) => k + (line.split(span).length - 1), 0)
-      if (have < n) {
+      if (wholeLines(before, span) < n) {
         moved.push(v)
         break
       }
@@ -289,7 +298,6 @@ function maskKnown(text: string): { text: string; count: number } {
 // ---------------------------------------------------------------------------
 // Layer 1a: our own known formats (the whole match is masked).
 const WHOLE: RegExp[] = [
-  /-----BEGIN [A-Z0-9 ]*PRIVATE KEY(?: BLOCK)?-----[\s\S]*?-----END [A-Z0-9 ]*PRIVATE KEY(?: BLOCK)?-----/g,
   /\bsk-ant-[A-Za-z0-9_-]{20,}/g, // Anthropic
   /\bsk-(?:proj-|svcacct-|admin-)?[A-Za-z0-9_-]{20,}/g, // OpenAI
   /\b(?:AKIA|ASIA|AGPA|AIDA|AROA)[0-9A-Z]{16}\b/g, // AWS
@@ -318,6 +326,40 @@ const WHOLE: RegExp[] = [
   /\beyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}/g, // JWT
   /\$2[aby]\$\d{2}\$[A-Za-z0-9./]{53}/g, // bcrypt hash
 ]
+
+// PEM private keys, in one pass: each BEGIN is paired with the next END, so a text full of
+// BEGIN lines and no END is not scanned to its end once per BEGIN.
+// (gitleaks' own private-key rule is skipped: its lazy body is quadratic on such a text)
+const PK_BEGIN = /-----BEGIN[ A-Z0-9_-]{0,100}PRIVATE KEY(?: BLOCK)?-----/g
+const PK_END = /-----END[ A-Z0-9_-]{0,100}KEY(?: BLOCK)?-----/g
+const PK_MAX = 64 * 1024
+function maskPrivateKeys(text: string): { text: string; count: number } {
+  if (!text.includes('PRIVATE KEY')) return { text, count: 0 }
+  const parts: string[] = []
+  let count = 0
+  let pos = 0
+  let end: RegExpExecArray | null | undefined
+  PK_BEGIN.lastIndex = 0
+  PK_END.lastIndex = 0
+  for (let b = PK_BEGIN.exec(text); b !== null; b = PK_BEGIN.exec(text)) {
+    if (b.index < pos) continue
+    if (end === undefined || (end !== null && end.index < PK_BEGIN.lastIndex)) {
+      PK_END.lastIndex = PK_BEGIN.lastIndex
+      end = PK_END.exec(text)
+    }
+    if (end === null) break // no END after this BEGIN: none after any later one either
+    const stop = end.index + end[0].length
+    if (stop - b.index > PK_MAX) continue
+    parts.push(text.slice(pos, b.index), mask(text.slice(b.index, stop)))
+    count++
+    hit('format')
+    pos = stop
+    PK_BEGIN.lastIndex = stop
+  }
+  if (count === 0) return { text, count: 0 }
+  parts.push(text.slice(pos))
+  return { text: parts.join(''), count }
+}
 
 // ---------------------------------------------------------------------------
 // Layer 1b: gitleaks' ruleset (hooks/gitleaks-rules.ts, generated).
@@ -378,12 +420,17 @@ function gitleaksAllowed(rule: Compiled, secret: string, match: string): boolean
   return false
 }
 
+// Lowercases ASCII letters only, so every index of the result is the same as in `s`
+// (`'İ'.toLowerCase()` is two characters, which would shift the keyword spans).
+const lowerAscii = (s: string) => s.replace(/[A-Z]+/g, m => m.toLowerCase())
+
 function applyGitleaks(text: string, paths: readonly string[]): { text: string; count: number } {
   let count = 0
   let out = text
-  let low = out.toLowerCase()
+  let low = lowerAscii(out)
   for (const rule of compiledGitleaks()) {
     checkBudget()
+    if (rule.id === 'private-key') continue // maskPrivateKeys
     if (rule.path && !paths.some(p => rule.path!.test(p))) continue // a path-scoped rule needs its file
     if (rule.keywords && !rule.keywords.some(k => low.includes(k))) continue
     let changed = false
@@ -407,13 +454,14 @@ function applyGitleaks(text: string, paths: readonly string[]): { text: string; 
       const parts: string[] = []
       let pos = 0
       for (const [a, b] of windows) {
+        checkBudget()
         parts.push(out.slice(pos, a), apply(out.slice(a, b)))
         pos = b
       }
       parts.push(out.slice(pos))
       out = parts.join('')
     }
-    if (changed) low = out.toLowerCase()
+    if (changed) low = lowerAscii(out)
   }
   return { text: out, count }
 }
@@ -690,10 +738,20 @@ const MAX_LINE = 20000
  * `sources`: the files the output certainly is the content of (a Read's file): values masked
  * in it may be restored into these files, and only these.
  */
-export type Options = { envMode?: boolean; paths?: readonly string[]; sources?: readonly string[] }
+export type Options = {
+  envMode?: boolean
+  paths?: readonly string[]
+  sources?: readonly string[]
+  /** Every line is one bare value (`printenv NAME`): each is masked whole. */
+  bareValues?: boolean
+}
 
 function redactLine(line: string, opts: Options): { line: string; count: number } {
   let count = 0
+  if (opts.bareValues) {
+    const t = line.trim()
+    if (t !== '' && !t.includes(MASK) && !isPlaceholderValue(t, true)) return { line: line.replace(t, mask(t, false)), count: 1 }
+  }
   const g = grepSplit(line)
   if (g) {
     const r = envLine(g.rest)
@@ -727,7 +785,14 @@ function redactAll(text: string, opts: Options): { text: string; count: number }
   out = k.text
   count += k.count
 
-  for (const re of WHOLE) out = out.replace(re, (m: string) => (count++, hit('format'), mask(m)))
+  const pk = maskPrivateKeys(out)
+  out = pk.text
+  count += pk.count
+
+  for (const re of WHOLE) {
+    checkBudget()
+    out = out.replace(re, (m: string) => (count++, hit('format'), mask(m)))
+  }
 
   const gl = applyGitleaks(out, opts.paths ?? [])
   out = gl.text

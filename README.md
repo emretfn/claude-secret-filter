@@ -42,9 +42,9 @@ Nothing else needs to be installed: gitleaks' rules ship converted, as a file.
 ![How secret-filter sits between Claude and its tools: tool output goes through the read hook and the redaction engine, so Claude only sees placeholders; real values stay in an in-memory vault, seeded from .env files, and the write hook puts them back when Claude edits a file.](docs/architecture.png)
 
 - **Reading.** Every call to `Bash`, `Read`, `WebFetch`, `WebSearch` or an MCP tool runs as usual. Its output goes through the redaction engine before Claude sees it, failed calls included. Claude reads placeholders where the secrets were.
-- **Everything else.** Every other row the conversation keeps (other tools such as `Monitor`, background task and subagent results, notifications, attachments) goes through the same engine before the model or the transcript file reads it. Only your own prompt and Claude's own reply are left as written.
+- **Everything else.** Every other row the conversation keeps (other tools such as `Monitor`, background task and subagent results, notifications, attachments) goes through the same engine before the model reads it. Only your own prompt and Claude's own reply are left as written. Some raw output reaches disk before this point: see [Limits](#limits).
 - **The vault.** Each masked value is kept in the mod's memory under its placeholder id, with the files it was read from. Values from the project's git-ignored `.env`-style files are learned at session start.
-- **Writing.** When Claude edits a file and copies a placeholder into `Edit`, `Write` or `NotebookEdit`, the write hook swaps the real value back in before the write, **only in the file the value was read from, and only where it already was** (its own line). What the tool returns is masked again.
+- **Writing.** When Claude edits a file and copies a placeholder into `Edit` or `Write`, the write hook swaps the real value back in before the write, **only in the file the value was read from, and only on a line kept exactly as it was**. What the tool returns is masked again.
 
 The diagram sources are in [`docs/`](docs/) (HTML with inline SVG).
 
@@ -73,17 +73,18 @@ from env files.
   are kept in the mod's memory only: never written to disk, never sent to the model.
   Ids are a keyed hash with a random per-session key, so a placeholder that ends up
   somewhere public cannot be checked against guessed passwords.
-- For `Edit`, `Write` and `NotebookEdit`, placeholders in the input are turned back
-  into the real values just before the write. The tool's result is masked again,
+- For `Edit` and `Write`, placeholders in the input are turned back into the real
+  values just before the write. The tool's result is masked again,
   and a restored value stays masked in every later output, whatever it looks like.
 - **A value is only restored into the file it was read from with `Read`, and only
-  where it already was**: each place it lands, the text around it on its line must
-  be part of a line it had in that file (or in the `old_string` an `Edit` replaces).
-  It can be kept, or its line trimmed, never moved into a new line, another file,
-  a new script, a notebook cell or a URL; nothing is restored under `.git/`. So a
-  prompt injection cannot make the mod write a secret somewhere it can be run or
-  sent. Command output (`cat a b`) names no file for sure, so its placeholders are
-  restored nowhere. To move a secret to a new place, add it yourself.
+  on a line kept exactly as it was**: the mod compares the whole file before and
+  after the write, and every line that holds a restored value must be a line of the
+  file as it is, unchanged, no more often than there. Claude can edit the lines
+  around a secret, or delete its line; editing, splitting or copying the line itself
+  is refused, so a value is never moved into a new line, another file, a script or a
+  URL. Nothing is restored under `.git/` or into a notebook (`NotebookEdit`).
+  Command output (`cat a b`) names no file for sure, so its placeholders are
+  restored nowhere. To change a line that holds a secret, edit it yourself.
 - In auto mode, a write that restores real values is put to you instead of to the
   classifier, which would read its input.
 - A placeholder the mod does not know (after a reload) makes the write refuse
@@ -107,8 +108,15 @@ never learned as known values, so a false positive does not spread.
 
 This is defense in depth, not a guarantee. It does not:
 
-- stop a command from **sending** a secret somewhere (`curl -d "$TOKEN" …`): it only
-  filters what Claude reads.
+- stop a command from **sending** a secret somewhere (`curl -d "$TOKEN" …`,
+  `curl -d @.env …`): it only filters what Claude reads. It is not a sandbox: a
+  command can read any file the session can.
+- keep raw output off your disk. Claude Code writes some output to its own files
+  before any hook sees it: the full output of a large `Bash` result (`tool-results/`
+  in the session folder), the output files of background tasks and `Monitor`
+  (`tasks/`), and the transcript of a subagent that ran `Monitor`. What Claude reads
+  from those is masked, the files themselves are not. Treat the session folder under
+  `~/.claude/projects/` as holding secrets.
 - mask what you type or paste into the prompt yourself, or the output of a `!`
   command you run: those are yours, kept as written. An `@`-mention of a secret
   file is refused (Claude can `Read` it, masked); other mentions are masked.

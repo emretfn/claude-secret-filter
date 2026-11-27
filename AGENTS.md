@@ -13,8 +13,10 @@ the project's secret files, and shows toasts. Real values stay in module memory.
   same pull request, so a reviewer sees it next to the code that needs it.
 - Persisting the vault is out of scope: no disk writes, no `$.store`, no `$.state`.
 - A real value is restored only into a file it was read from with `Read` (its
-  sources in the vault), only where it already was in that file (`movedValues`: its
-  line, or part of it), never under `.git/`. Restoring is the one place the mod puts
+  sources in the vault), only on a line of that file kept unchanged (`movedValues`,
+  on the whole file before and after the write), never under `.git/`, never by
+  `NotebookEdit`. Three audits found a way around every looser rule (substring
+  spans, trimmed lines, an `old_string` that is part of a line): keep it this strict. Restoring is the one place the mod puts
   a secret back into the world: a change that widens it needs a test showing a
   placeholder cannot reach another file, a new line, a command or a URL.
 - Redaction is bounded in time (`withBudget`): past it the hook throws and its
