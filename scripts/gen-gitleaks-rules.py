@@ -37,7 +37,9 @@ PINNED_TAG = "v8.30.1"
 # Updating the tag means updating this hash in the same pull request.
 PINNED_SHA256 = "e163e53b9e7e8a8511e77271e2b323ed057759542a6d988258afe3a1fa329caf"
 URL = "https://raw.githubusercontent.com/gitleaks/gitleaks/{tag}/config/gitleaks.toml"
-OUT = Path(__file__).resolve().parent.parent / "hooks" / "gitleaks-rules.ts"
+# --root: write into another checkout (CI runs main's copy of this script on a pull request)
+ROOT = Path(sys.argv[sys.argv.index("--root") + 1]).resolve() if "--root" in sys.argv else Path(__file__).resolve().parent.parent
+OUT = ROOT / "hooks" / "gitleaks-rules.ts"
 
 POSIX = {
     "[:alnum:]": "a-zA-Z0-9", "[:alpha:]": "a-zA-Z", "[:digit:]": "0-9", "[:lower:]": "a-z",
@@ -118,7 +120,7 @@ def allowlist(a: dict) -> dict:
 
 
 def main() -> None:
-    args = sys.argv[1:]
+    args = [a for i, a in enumerate(sys.argv[1:], 1) if a != "--root" and sys.argv[i - 1] != "--root"]
     tag = PINNED_TAG
     if args[:1] == ["--tag"]:
         tag, args = args[1], args[2:]

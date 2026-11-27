@@ -48,6 +48,7 @@ PLUGIN_KEYS = {"name", "version", "description", "license", "keywords", "author"
 MARKETPLACE = {"name", "owner", "plugins", "description"}
 
 FORBIDDEN = {
+    r"\bconsole\b": "console (its output may land in a log file)",
     r"\bfetch\b": "network: fetch",
     r"\bXMLHttpRequest\b": "network: XMLHttpRequest",
     r"\bWebSocket\b": "network: WebSocket",
@@ -67,7 +68,10 @@ FORBIDDEN = {
     r"\bsetTimeout\s*\(\s*['\"`]": "setTimeout with a string",
     r"(?<![\\\w])\$\s*\[": "$ accessed by index",  # not an escaped \$ inside a regex
 }
-IMPORT = re.compile(r"""^\s*import\b[^'"]*['"]([^'"]+)['"]""", re.M)
+# every module specifier: `import ... from`, a bare `import '...'`, and `export ... from`
+IMPORT = re.compile(r"""(?:\bfrom\s*|^\s*import\s*)['"]([^'"]+)['"]""", re.M)
+# a \u escape that spells an identifier character could hide a name (fetch) from the patterns
+UNICODE_ESCAPE = re.compile(r"\\u(?:\{([0-9a-fA-F]+)\}|([0-9a-fA-F]{4}))")
 ALLOWED_IMPORTS = {"claude-code", "./redact", "./gitleaks-rules"}
 DOLLAR_CALL = re.compile(r"\$\.([A-Za-z_]\w*)\.([A-Za-z_]\w*)")
 
@@ -95,6 +99,10 @@ def static_check() -> list[str]:
             for m in re.finditer(pattern, src):
                 line = src.count("\n", 0, m.start()) + 1
                 errors.append(f"hooks/{p.name}:{line}: forbidden ({what})")
+        for m in UNICODE_ESCAPE.finditer(src):
+            if re.fullmatch(r"[A-Za-z0-9_$]", chr(int(m.group(1) or m.group(2), 16))):
+                line = src.count("\n", 0, m.start()) + 1
+                errors.append(f"hooks/{p.name}:{line}: forbidden (a \\u escape of an identifier character)")
         for spec in IMPORT.findall(src):
             if spec not in ALLOWED_IMPORTS:
                 errors.append(f"hooks/{p.name}: forbidden import {spec!r}")
@@ -102,6 +110,41 @@ def static_check() -> list[str]:
             call = f"$.{noun}.{method}"
             if call not in ALLOWED_CALLS:
                 errors.append(f"hooks/{p.name}: forbidden engine call {call}")
+        errors += next_check(p.name, src)
+    return errors
+
+
+# What a hook passes down with next(...): the event as it came, or one of these
+# rewrites, each as often as listed. A hook that rewrites its input (a WebFetch URL, a
+# command) can carry a secret out through a tool, so a new rewrite is reviewed here.
+NEXT_REWRITES = {
+    "register.ts": {
+        "{ ...e, ...rewritten } as typeof e": 1,  # Edit/Write: placeholders restored
+        "{ ...e, message: { ...e.message, content } }": 2,  # session.append: masked row
+    },
+}
+NEXT_CALL = re.compile(r"\bnext\(([^()]*)\)")
+NEXT_OTHER = re.compile(r"\bnext\b(?!\(|\.called\b)")
+NEXT_PARAM = re.compile(r"\(\s*_?\$\s*,\s*_?e\s*,\s*next\s*\)")
+
+
+def next_check(name: str, src: str) -> list[str]:
+    errors = []
+    found: dict[str, int] = {}
+    for m in NEXT_CALL.finditer(src):
+        arg = " ".join(m.group(1).split())
+        if arg != "e":
+            found[arg] = found.get(arg, 0) + 1
+    expected = NEXT_REWRITES.get(name, {})
+    if found != expected:
+        errors.append(f"hooks/{name}: next(...) rewrites {found} differ from {expected} (a new input rewrite: allow it here, in review)")
+    # next only as a hook parameter, called, or asked `.called`: never passed on or renamed
+    # (single-quoted string literals are not code; comments are, so they avoid the word)
+    rest = re.sub(r"'(?:[^'\\\n]|\\.)*'", "", src)
+    rest = NEXT_PARAM.sub("", rest)
+    for m in NEXT_OTHER.finditer(rest):
+        line = rest.count("\n", 0, m.start()) + 1
+        errors.append(f"hooks/{name}: next used other than called (near line {line})")
     return errors
 
 
@@ -111,6 +154,10 @@ EXPECTED_TYPES = [
     "export type GitleaksRule = Src & { id: string; keywords?: string[]; entropy?: number; secretGroup?: number; path?: Src; allow?: Allow[] }",
 ]
 VALIDATE_NOTES = re.compile(r"^\./register\.ts (?:hooks: |gating hook with \.catch: |calls: )")
+# The events the module hooks, as the engine reports them: a new event is a new
+# capability (an `http.fetch` or `prompt.compose` hook could carry data out).
+EXPECTED_HOOKS = ("./register.ts hooks: prompt.mention, session.start, tool.call{tool=?}, tool.call{tool=?}, "
+                  "tool.run{tool=?|?}, tool.judge{tool=?}, session.append")
 
 
 def data_check() -> list[str]:
@@ -172,6 +219,9 @@ def validate_check(report_path: str) -> list[str]:
     for n in notes:
         if not VALIDATE_NOTES.match(n):
             errors.append(f"claude plugin validate: unexpected note {n!r} (a new capability: allow it here, in review)")
+    hooks_notes = [n for n in notes if " hooks: " in n]
+    if hooks_notes != [EXPECTED_HOOKS]:
+        errors.append(f"claude plugin validate: the module hooks {hooks_notes!r}, expected [{EXPECTED_HOOKS!r}] (allow a new hook here, in review)")
     for c in [report.get("manifest", {}), *report.get("contents", [])]:
         if c.get("wasm"):
             errors.append("claude plugin validate: the plugin declares WebAssembly")
